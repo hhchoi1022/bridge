@@ -1,2 +1,6 @@
 *.fits
 *.csv
+
+# Large data files
+*.fits
+*.csv
