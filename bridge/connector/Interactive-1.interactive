@@ -1,0 +1,2420 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f32d18f5-1a1b-4619-8327-a04bd79a5e7f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from astropy.table.table import TableColumns\n",
+    "from pathlib import Path\n",
+    "import json\n",
+    "from typing import Any\n",
+    "from astropy.time import Time\n",
+    "from astropy.table import Table\n",
+    "from astropy.coordinates import SkyCoord\n",
+    "import astropy.units as u\n",
+    "import numpy as np\n",
+    "from tqdm import tqdm\n",
+    "import time\n",
+    "from collections import deque\n",
+    "import datetime\n",
+    "\n",
+    "from bridge.configuration import Configuration\n",
+    "from bridge.alertquerier import ALERCEQuerier\n",
+    "from bridge.alertquerier import TNSQuerier\n",
+    "from bridge.utils import HostGalaxyCatalog\n",
+    "from bridge.objects import Alert\n",
+    "from bridge.connector import SQLConnector, SDSConnector, GmailConnector"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "9f28fb88-8f14-4387-9d19-4647a1dd436f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class AlertTrigger:\n",
+    "    def __init__(self):\n",
+    "        self.config = Configuration(config_filenames=['alerttrigger.config'])\n",
+    "        self.initialize()\n",
+    "        self.trigger_history = deque(maxlen=20)  # keep last 20 trigger timestamps\n",
+    "\n",
+    "    def initialize(self):\n",
+    "        print('Start initializing the AlertTrigger...')\n",
+    "        self.alerce = ALERCEQuerier()\n",
+    "        self.tns = TNSQuerier()\n",
+    "        self.hostgalaxycatalog = HostGalaxyCatalog()\n",
+    "        # Cut hostgalaxy catalog\n",
+    "        self.hostgalaxycatalog.cut_catalog(z_final = '<' + str(self.config.hostgal_maxdist_redshift), distance_final = '<' + str(self.config.hostgal_maxdist_Mpc))\n",
+    "        self.db = SQLConnector()\n",
+    "        self.sds = SDSConnector()\n",
+    "        self.mail = GmailConnector()\n",
+    "        print('AlertTrigger initialized successfully!')\n",
+    "        \n",
+    "    def receive_alerts(self):\n",
+    "        mjd_start = Time.now().mjd - self.config.search_days\n",
+    "        \n",
+    "        # ALERCE Alert broker. (Receive -> Update DB -> Trigger)\n",
+    "        alerce_tbl = self.alerce.query_objects(\n",
+    "            class_name = self.alerce.config.classname,\n",
+    "            probability = self.alerce.config.probability,\n",
+    "            firstmjd = mjd_start,\n",
+    "            lastmjd = None,\n",
+    "            page = 1,\n",
+    "            page_size = 1000000\n",
+    "        )\n",
+    "        if len(alerce_tbl) == 0:\n",
+    "            print('No alerts found!')\n",
+    "            return\n",
+    "        alerce_tbl_recent = alerce_tbl[(alerce_tbl['mjdstarthist'] > mjd_start) & (alerce_tbl['meandec'] < self.config.decl_upper) & (alerce_tbl['meandec'] > self.config.decl_lower)]\n",
+    "        print(f\"{len(alerce_tbl_recent)} new alerts are found!\")\n",
+    "        for alerce_alert in tqdm(alerce_tbl_recent, desc = 'Checking alerts...'):\n",
+    "            \n",
+    "            alert_instance = Alert(\n",
+    "                cent_ra = float(alerce_alert['meanra']),\n",
+    "                cent_dec = float(alerce_alert['meandec']),\n",
+    "                objname = str(alerce_alert['oid']),\n",
+    "                alert_time = Time(alerce_alert['firstmjd'], format='mjd'),\n",
+    "                )\n",
+    "            \n",
+    "            alert_instance = self.check_alert(alert_instance)\n",
+    "            if not alert_instance is None:\n",
+    "                print(\"NEW ALERT FOUND!\") \n",
+    "                detection_tbl = self.alerce.query_detections(alert_instance.objname)\n",
+    "                if 'magpsf_cordd' in detection_tbl.columns:\n",
+    "                    magnitude = detection_tbl['magpsf_corr']\n",
+    "                else:\n",
+    "                    magnitude = detection_tbl['magpsf']\n",
+    "                try:\n",
+    "                    detection_tbl = detection_tbl[magnitude.mask]\n",
+    "                except:\n",
+    "                    pass\n",
+    "                mjd_now = Time.now().mjd\n",
+    "                closest_idx = np.argmin(np.abs(detection_tbl['mjd'] - mjd_now))\n",
+    "                magnitude = magnitude[closest_idx]\n",
+    "                distance_modulus = 5 * np.log10(float(alert_instance.host_galaxy_distance)) +25\n",
+    "                alert_instance.mag_expected = round(float(magnitude),2)\n",
+    "                alert_instance.absmag_expected = round(float(magnitude - distance_modulus),2)\n",
+    "                self.insert_alert_db_info(alert_instance)\n",
+    "                \n",
+    "    def get_alerts_db(self):\n",
+    "        data = self.db.get_data(tbl_name = 'transient_info', select_key = '*')\n",
+    "        if len(data) == 0:\n",
+    "            return None\n",
+    "        \n",
+    "        alertlist = []\n",
+    "        for row in data:\n",
+    "            alert_instance = Alert(\n",
+    "                cent_ra = float(row['cent_ra']),\n",
+    "                cent_dec = float(row['cent_dec']),\n",
+    "                objname = str(row['objname']),\n",
+    "                alert_time = Time(row['alert_time']),\n",
+    "                alert_id = str(row['alert_id']),\n",
+    "                create_time = Time(row['create_time']),\n",
+    "                trigger_time = Time(row['trigger_time']),\n",
+    "                is_triggered = bool(row['is_triggered']),\n",
+    "                radius = float(row['radius_arcsec']),\n",
+    "                \n",
+    "                exptime = float(row['exptime']),\n",
+    "                count = int(row['count']),\n",
+    "                obsmode = str(row['obsmode']),\n",
+    "                filter_ = str(row['filter_']),\n",
+    "                specmode = str(row['specmode']),\n",
+    "                ntelescope = int(row['ntelescope']),\n",
+    "                priority = int(row['priority']),\n",
+    "                weight = int(row['weight']),\n",
+    "                binning = int(row['binning']),\n",
+    "                gain = int(row['gain']),\n",
+    "                objtype = str(row['objtype']),\n",
+    "                is_ToO = int(row['is_ToO']),\n",
+    "                is_rapid_ToO = bool(row['is_rapid_ToO']),\n",
+    "                \n",
+    "                note = str(row['note']),\n",
+    "                host_galaxy = str(row['host_galaxy']),\n",
+    "                host_galaxy_distance = float(row['host_galaxy_distance']),\n",
+    "                host_galaxy_separation = float(row['host_galaxy_separation']),\n",
+    "                mag_expected = float(row['mag_expected']),\n",
+    "                absmag_expected = float(row['absmag_expected']),\n",
+    "            )\n",
+    "            alertlist.append(alert_instance)\n",
+    "        return alertlist\n",
+    "    \n",
+    "\n",
+    "    def _trigger_with_rate_limit(self):\n",
+    "        while self.alert_list:\n",
+    "            alert_instance = self.alert_list.pop(0)\n",
+    "            self.trigger_alert(alert_instance)\n",
+    "\n",
+    "            now = time.time()\n",
+    "            self.trigger_history.append(now)\n",
+    "\n",
+    "            # Count how many triggers in last 10 minutes\n",
+    "            recent_triggers = [t for t in self.trigger_history if now - t <= 600]\n",
+    "\n",
+    "            if len(recent_triggers) > 2:\n",
+    "                print(\"⚠️ More than 2 triggers in 1 min → waiting 5 min\")\n",
+    "                time.sleep(300)  # wait 5 minutes\n",
+    "            else:\n",
+    "                print(\"Sleeping 1 min before next trigger\")\n",
+    "                time.sleep(60)   # normal 1 minutes\n",
+    "                \n",
+    "    def trigger_alert(self, alert_instance: Alert):\n",
+    "        # Input ToO status \n",
+    "        # Send ToO observation mail (Trigger ToO observation)\n",
+    "        self.send_mail(alert_instance)\n",
+    "        alert_instance.is_triggered = True\n",
+    "        alert_instance.trigger_time = Time.now()\n",
+    "        self.input_trigger_status(alert_instance)\n",
+    "        self.update_alert_db(alert_instance)\n",
+    "        \n",
+    "    def check_alert(self, alert_instance: Alert):\n",
+    "        progress = {\n",
+    "            \"Already in DB\": False,\n",
+    "            \"Visibility (now/tonight)\": False,\n",
+    "            \"Host galaxy\": False,\n",
+    "            \"Detections & stamp\": False,\n",
+    "        }\n",
+    "\n",
+    "        # 1. Already in DB\n",
+    "        alert_in_db = self.get_alert_db_info(objname=alert_instance.objname,\n",
+    "                                           alert_time=alert_instance.alert_time)\n",
+    "        if alert_in_db is not None:\n",
+    "            self._print_progress(title = alert_instance.objname, progress_dict = progress, stop=\"Already in DB\")\n",
+    "            return None\n",
+    "        progress[\"Already in DB\"] = True\n",
+    "\n",
+    "        # 2. Visibility\n",
+    "        now = Time.now()\n",
+    "        if not alert_instance.is_observable_tonight(now):\n",
+    "            self._print_progress(title = alert_instance.objname, progress_dict = progress, stop=\"Not observable tonight\")\n",
+    "            return None\n",
+    "        progress[\"Visibility (now/tonight)\"] = True\n",
+    "\n",
+    "        # 3. Host galaxy\n",
+    "        host_galaxy_nearby = self.hostgalaxycatalog.search_catalog(\n",
+    "            alert_instance.cent_ra, alert_instance.cent_dec, 0.5\n",
+    "        )\n",
+    "        host_galaxy_within_radius = host_galaxy_nearby[\n",
+    "            host_galaxy_nearby['separation'] < host_galaxy_nearby['diameter_final']\n",
+    "        ]\n",
+    "        if len(host_galaxy_within_radius) == 0:\n",
+    "            self._print_progress(title = alert_instance.objname, progress_dict = progress, stop=\"No host galaxy within radius\")\n",
+    "            return None\n",
+    "        progress[\"Host galaxy\"] = True\n",
+    "        \n",
+    "        alert_instance.host_galaxy = host_galaxy_within_radius['objname_NED'][0]\n",
+    "        alert_instance.host_galaxy_distance = float(host_galaxy_within_radius['distance_final'][0])\n",
+    "        alert_instance.host_galaxy_separation = float(host_galaxy_within_radius['separation'][0])\n",
+    "        \n",
+    "        savepath_visibility = Path(self.config.save_dir) / f'{alert_instance.objname}_visibility.png' if self.config.save_visibility else None\n",
+    "        if (self.config.show_visibility) or (self.config.save_visibility):\n",
+    "            alert_instance.plot_visibility(utctime = now, \n",
+    "                                           show = self.config.show_visibility, \n",
+    "                                           save_path = savepath_visibility)\n",
+    "        \n",
+    "        savepath_stamp = Path(self.config.save_dir) / f'{alert_instance.objname}_stamp.png' if self.config.save_stamp else None\n",
+    "        if (self.config.show_stamp) or (self.config.save_stamp):\n",
+    "            self.alerce.plot_stamp(object_id = alert_instance.objname, \n",
+    "                                   show = self.config.show_stamp, \n",
+    "                                   save_path = savepath_stamp)\n",
+    "        progress[\"Detections & stamp\"] = True\n",
+    "\n",
+    "        # Print final result\n",
+    "        self._print_progress(title = alert_instance.objname, progress_dict = progress, stop=None)\n",
+    "        return alert_instance  # Or whatever you want to return\n",
+    "    \n",
+    "    def send_mail(self, alert_instance):\n",
+    "        \"\"\"\n",
+    "        Send email notification for a new alert_instance,\n",
+    "        strictly following the ToO email format.\n",
+    "        \"\"\"\n",
+    "\n",
+    "        subject = f\"[Automated] 7DT ToO Observation Request: {alert_instance.objname}\"\n",
+    "\n",
+    "        email_body = f\"\"\"\n",
+    "        ================================\n",
+    "        New ToO Request Submitted\n",
+    "        ================================\n",
+    "\n",
+    "        **Observation Information**\n",
+    "        ----------------------\n",
+    "        - Requester: {self.config.mail_requester}\n",
+    "        - Target Name: {alert_instance.objname}\n",
+    "        - Right Ascension (R.A.): {alert_instance.cent_ra:.5f}\n",
+    "        - Declination (Dec.): {alert_instance.cent_dec:.5f}\n",
+    "        - Total Exposure Time (seconds): {alert_instance.exptime * alert_instance.count:.1f}\n",
+    "        - Single Exposure Time (seconds): {alert_instance.exptime:.1f}\n",
+    "        - # of images: {alert_instance.count}\n",
+    "        - Obsmode: {alert_instance.obsmode}\n",
+    "\n",
+    "        **Detailed Settings**\n",
+    "        --------------------\n",
+    "        - Abort Current Observation: {alert_instance.is_rapid_ToO}\n",
+    "        - Priority: {alert_instance.priority}\n",
+    "        - Gain: {alert_instance.gain}\n",
+    "        - Radius (arcsec): {alert_instance.radius}\n",
+    "        - Binning: {alert_instance.binning}\n",
+    "        - Observation Start Time: None\n",
+    "        - Comments: Triggered automatically with 7DT SN ToO Project\n",
+    "\n",
+    "        ================================\n",
+    "        Please take necessary actions.\n",
+    "        ================================\n",
+    "        \"\"\"\n",
+    "\n",
+    "        try:\n",
+    "            self.mail.send_mail(to_users = self.config.mail_recipients, subject = subject, body = email_body)\n",
+    "            return True\n",
+    "        except Exception as e:\n",
+    "            print(f\"❌ Failed to send email for {alert_instance.objname}: {e}\")\n",
+    "            return False\n",
+    "        \n",
+    "                \n",
+    "    def input_trigger_status(self, alert_instance: Alert):\n",
+    "        colnames = [\n",
+    "            'alert_id',\n",
+    "            'trigger_time',\n",
+    "            'update_time',\n",
+    "            'objname',\n",
+    "            'tile_id',\n",
+    "            ]\n",
+    "        \n",
+    "        savepath_tile = Path(self.config.save_dir) / f'{alert_instance.objname}_tile.png' if self.config.save_tile else None\n",
+    "        matched_tbl = self.sds.find_overlapping_tiles(\n",
+    "            list_ra = [alert_instance.cent_ra], \n",
+    "            list_dec = [alert_instance.cent_dec], \n",
+    "            list_aperture = [alert_instance.radius],\n",
+    "            visualize = self.config.show_tile,\n",
+    "            save_fig = self.config.save_tile,\n",
+    "            visualize_savepath = savepath_tile,\n",
+    "            match_tolerance_minutes = self.config.tile_edge_tolerance_minutes,\n",
+    "            )[0]\n",
+    "        \n",
+    "        if alert_instance.trigger_time is None:\n",
+    "            trigger_time = None\n",
+    "        else:\n",
+    "            trigger_time = alert_instance.trigger_time.isot\n",
+    "        \n",
+    "        # When the alert is not covered by 7DS\n",
+    "        if len(matched_tbl) == 0:\n",
+    "            tile_id = alert_instance.objname\n",
+    "        \n",
+    "        else:\n",
+    "            if len(matched_tbl) > 1:\n",
+    "                alert_instance.is_multitarget = True\n",
+    "                for row in matched_tbl:\n",
+    "                    tile_id = str(row['id'])\n",
+    "                    values = [\n",
+    "                        alert_instance.alert_id,\n",
+    "                        trigger_time,\n",
+    "                        Time.now().isot,\n",
+    "                        alert_instance.objname,\n",
+    "                        tile_id\n",
+    "                    ]\n",
+    "                    self.db.insert_rows(tbl_name = 'transient_status', data = Table(names = colnames, rows = [values]))\n",
+    "            else:\n",
+    "                alert_instance.is_multitarget = False\n",
+    "                tile_id = str(matched_tbl['id'][0])\n",
+    "                values = [\n",
+    "                    alert_instance.alert_id,\n",
+    "                    trigger_time,\n",
+    "                    Time.now().isot,\n",
+    "                    alert_instance.objname,\n",
+    "                    tile_id\n",
+    "                ]\n",
+    "                self.db.insert_rows(tbl_name = 'transient_status', data = Table(names = colnames, rows = [values]))\n",
+    "        self.update_alert_db(alert_instance)        \n",
+    "    \n",
+    "    def update_alert_db_info(self, alert_instance: Alert):\n",
+    "        \n",
+    "        input_dict = alert_instance.__dict__\n",
+    "        # If isinstance(Time), convert to isot\n",
+    "        input_dict = {key: Time(value).isot if isinstance(value, (Time, datetime.datetime)) else value for key, value in input_dict.items()}\n",
+    "        # If not float, int, str, bool, None, remove\n",
+    "        input_dict = {key: value for key, value in input_dict.items() if (np.isscalar(value)) or (value is None)}\n",
+    "        # Remove alert_id\n",
+    "        keys = input_dict.keys()\n",
+    "        values = input_dict.values()\n",
+    "        \n",
+    "        result = self.db.update_row(tbl_name = 'transient_info', update_value = values, update_key = keys, id_value = alert_instance.alert_id, id_key = 'alert_id')\n",
+    "        return result\n",
+    "    \n",
+    "    def insert_alert_db_info(self, alert_instance: Alert):\n",
+    "        input_dict = alert_instance.__dict__\n",
+    "        # If isinstance(Time), convert to isot\n",
+    "        input_dict = {key: Time(value).isot if isinstance(value, (Time, datetime.datetime)) else value for key, value in input_dict.items()}\n",
+    "        # If not float, int, str, bool, None, remove\n",
+    "        input_dict = {key: value for key, value in input_dict.items() if (np.isscalar(value)) or (value is None)}\n",
+    "        \n",
+    "        result = self.db.insert_rows(tbl_name = 'transient_info', data = Table(names = input_dict.keys(), rows = [input_dict.values()]))\n",
+    "        return result\n",
+    "    \n",
+    "    def get_alert_db_info(self, \n",
+    "                         idx: int = None,\n",
+    "                         alert_id: str = None,\n",
+    "                         objname: str = None,\n",
+    "                         cent_ra: float = None,\n",
+    "                         cent_dec: float = None,\n",
+    "                         alert_time: Time = None):\n",
+    "        \n",
+    "        data = self.db.get_data(tbl_name = 'transient_info', select_key = '*')\n",
+    "        if len(data) == 0:\n",
+    "            return None\n",
+    "        \n",
+    "        target_row = data\n",
+    "        if idx is not None:\n",
+    "            target_row = target_row[idx]\n",
+    "        if len(target_row) == 0:\n",
+    "            return None\n",
+    "        if alert_id is not None:\n",
+    "            target_row = target_row[target_row['alert_id'] == alert_id]\n",
+    "        if len(target_row) == 0:\n",
+    "            return None\n",
+    "        if objname is not None:\n",
+    "            target_row = target_row[target_row['objname'] == objname]\n",
+    "        if len(target_row) == 0:\n",
+    "            return None\n",
+    "        if cent_ra is not None and cent_dec is not None:\n",
+    "            target_coord = SkyCoord(ra = cent_ra * u.deg, dec = cent_dec * u.deg)\n",
+    "            data_coord = SkyCoord(ra = target_row['cent_ra'] * u.deg, dec = target_row['cent_dec'] * u.deg)\n",
+    "            sep = target_coord.separation(data_coord)\n",
+    "            close_idx = np.where(sep < 30 * u.arcsec)[0]\n",
+    "            target_row = target_row[close_idx]\n",
+    "        if len(target_row) == 0:\n",
+    "            return None\n",
+    "        if alert_time is not None:\n",
+    "            alert_time = Time(alert_time)\n",
+    "            db_alert_time = Time(target_row['alert_time'])\n",
+    "            close_idx = np.where(np.abs(db_alert_time - alert_time) < 1)[0]\n",
+    "            target_row = target_row[close_idx]\n",
+    "        if len(target_row) == 0:\n",
+    "            return None\n",
+    "\n",
+    "        if len(target_row) > 1:\n",
+    "            print(f\"Multiple targets found. Returning the first one\")\n",
+    "        \n",
+    "        target_row = target_row[0]\n",
+    "        trigger_time = target_row['trigger_time']\n",
+    "        if trigger_time is None:\n",
+    "            trigger_time = None\n",
+    "        else:\n",
+    "            trigger_time = Time(trigger_time)\n",
+    "        \n",
+    "        host_galaxy = target_row['host_galaxy']\n",
+    "        if host_galaxy is None:\n",
+    "            host_galaxy = None\n",
+    "        else:\n",
+    "            host_galaxy = str(host_galaxy)\n",
+    "        \n",
+    "        host_galaxy_distance = target_row['host_galaxy_distance']\n",
+    "        if host_galaxy_distance is None:\n",
+    "            host_galaxy_distance = None\n",
+    "        else:\n",
+    "            host_galaxy_distance = float(host_galaxy_distance)\n",
+    "\n",
+    "        host_galaxy_separation = target_row['host_galaxy_separation']\n",
+    "        if host_galaxy_separation is None:\n",
+    "            host_galaxy_separation = None\n",
+    "        else:\n",
+    "            host_galaxy_separation = float(host_galaxy_separation)\n",
+    "        \n",
+    "        mag_expected = target_row['mag_expected']\n",
+    "        if mag_expected is None:\n",
+    "            mag_expected = None\n",
+    "        else:\n",
+    "            mag_expected = float(mag_expected)\n",
+    "        \n",
+    "        absmag_expected = target_row['absmag_expected']\n",
+    "        if absmag_expected is None:\n",
+    "            absmag_expected = None\n",
+    "        else:\n",
+    "            absmag_expected = float(absmag_expected)\n",
+    "        \n",
+    "        note = target_row['note']\n",
+    "        if note is None:\n",
+    "            note = None\n",
+    "        else:\n",
+    "            note = str(note)\n",
+    "        \n",
+    "        input_dict = dict(target_row)\n",
+    "        # If isinstance(Time), convert to isot\n",
+    "        import datetime\n",
+    "        input_dict = {key: Time(value).isot if isinstance(value, (Time, datetime.datetime)) else value for key, value in input_dict.items()}\n",
+    "        # If not float, int, str, bool, None, remove\n",
+    "        input_dict = {key: value for key, value in input_dict.items() if (np.isscalar(value)) or (value is None)}\n",
+    "        \n",
+    "        alert_instance = Alert(\n",
+    "            alert_id = target_row['alert_id'],\n",
+    "            objname = target_row['objname'],\n",
+    "            cent_ra = target_row['cent_ra'],\n",
+    "            cent_dec = target_row['cent_dec'],\n",
+    "            radius = target_row['radius'],\n",
+    "            \n",
+    "            # AlertInfo\n",
+    "            alert_time = target_row['alert_time'],\n",
+    "            create_time = target_row['create_time'],\n",
+    "            exptime = target_row['exptime'],\n",
+    "            count = target_row['count'],\n",
+    "            obsmode = target_row['obsmode'],\n",
+    "            filter_ = target_row['filter_'],\n",
+    "            specmode = target_row['specmode'],\n",
+    "            ntelescope = target_row['ntelescope'],\n",
+    "            priority = target_row['priority'],\n",
+    "            weight = target_row['weight'],\n",
+    "            binning = target_row['binning'],\n",
+    "            gain = target_row['gain'],\n",
+    "            objtype = target_row['objtype'],\n",
+    "            is_ToO = target_row['is_ToO'],\n",
+    "            is_rapid_ToO = target_row['is_rapid_ToO'],\n",
+    "            \n",
+    "            note = target_row['note'],\n",
+    "            host_galaxy = target_row['host_galaxy'],\n",
+    "            host_galaxy_distance = target_row['host_galaxy_distance'],\n",
+    "            host_galaxy_separation = target_row['host_galaxy_separation'],\n",
+    "            mag_expected = target_row['mag_expected'],\n",
+    "            absmag_expected = target_row['absmag_expected'])\n",
+    "\n",
+    "        return alert_instance\n",
+    "    \n",
+    "    def _print_progress(self, title, progress_dict, stop=None):\n",
+    "        print(f\"\\n--- ALERT {title} Progress ---\")\n",
+    "        for step, done in progress_dict.items():\n",
+    "            checkbox = \"✅\" if done else \"⬜\"\n",
+    "            print(f\"{checkbox} {step}\")\n",
+    "        if stop:\n",
+    "            print(f\"⚠️ Stopped: {stop}\")\n",
+    "        print(\"-----------------------------\\n\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d9cb6d6f-1f21-4ad8-9f48-ee300c4d3e98",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Start initializing the AlertTrigger...\n",
+      "Loading GLADE catalog from /home/hhchoi1022/.bridge/hostgalaxycatalog.fits ...\n",
+      "GLADE catalog loaded with 3184315 sources.\n",
+      "Building healpix index dictionary...\n",
+      "Healpix index built.\n",
+      "Start cutting catalog... with kwargs = {'z_final': '<0.1', 'distance_final': '<400'}\n",
+      "Cutting z_final with <0.1...\n",
+      "Cutting distance_final with <400...\n",
+      "Nearby catalog cut with 3184315 sources.\n",
+      "Building healpix index dictionary...\n",
+      "Healpix index built.\n",
+      "AlertTrigger initialized successfully!\n"
+     ]
+    }
+   ],
+   "source": [
+    "if __name__ == \"__main__\":\n",
+    "    self = AlertTrigger()\n",
+    "    # while True:\n",
+    "    #     print(\"Receiving alerts... at\", Time.now().isot)\n",
+    "    #     self.receive_alerts()\n",
+    "    #     time.sleep(300)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "self.config.search_days = 10\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Querying alerts from ALERCEBroker\n",
+      "===== Configuration =====\n",
+      "classifier  : stamp_classifier\n",
+      "classname   : SN\n",
+      "ndetection  : None\n",
+      "probability : 0.5\n",
+      "firstmjd    : None\n",
+      "lastmjd     : 60622.12345\n",
+      "ra          : None\n",
+      "dec         : None\n",
+      "radius      : None\n",
+      "page        : 1\n",
+      "page_size   : 10\n",
+      "order_by    : firstmjd\n",
+      "order_mode  : DESC\n",
+      "max_retries : 3\n",
+      "retry_delay : 5\n",
+      "Retry 1 of 3: Error querying objects: {'Error code': 504, 'Message': 'Unknown API error.', 'Data': 'Unknown API error.'}\n",
+      "Query finished: elapsed time=  89.44937586784363 seconds\n",
+      "Number of alerts:  193\n",
+      "56 new alerts are found!\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   2%|▏         | 1/56 [00:02<01:50,  2.00s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accytaa Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   4%|▎         | 2/56 [00:02<01:09,  1.29s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acczblu Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   5%|▌         | 3/56 [00:03<00:54,  1.03s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acddkek Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   7%|▋         | 4/56 [00:04<00:46,  1.11it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdscns Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   9%|▉         | 5/56 [00:04<00:41,  1.22it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accqjrb Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  11%|█         | 6/56 [00:05<00:39,  1.27it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accwneu Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  12%|█▎        | 7/56 [00:06<00:36,  1.34it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accyzae Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  14%|█▍        | 8/56 [00:06<00:35,  1.36it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acczwqv Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  16%|█▌        | 9/56 [00:07<00:34,  1.38it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acddjfo Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  18%|█▊        | 10/56 [00:08<00:33,  1.39it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acddjfo Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  20%|█▉        | 11/56 [00:09<00:32,  1.39it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdeiid Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  21%|██▏       | 12/56 [00:09<00:31,  1.40it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdioea Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n",
+      "Querying stamp from ALERCEBroker\n",
+      "Object ID:  ZTF25acdiujz\n",
+      "\n",
+      "--- ALERT ZTF25acdiujz Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "✅ Host galaxy\n",
+      "✅ Detections & stamp\n",
+      "-----------------------------\n",
+      "\n",
+      "NEW ALERT FOUND!\n",
+      "Querying detections from ALERCEBroker\n",
+      "Object ID:  ZTF25acdiujz\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  25%|██▌       | 14/56 [00:17<01:28,  2.11s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdqdbg Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  27%|██▋       | 15/56 [00:18<01:09,  1.69s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdqupg Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  29%|██▊       | 16/56 [00:19<00:55,  1.39s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdsbdm Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  30%|███       | 17/56 [00:19<00:46,  1.19s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acebiml Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  32%|███▏      | 18/56 [00:20<00:39,  1.04s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF21abncspe Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  34%|███▍      | 19/56 [00:21<00:34,  1.07it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accxnjx Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  36%|███▌      | 20/56 [00:22<00:31,  1.15it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accytbz Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  38%|███▊      | 21/56 [00:22<00:28,  1.22it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acczwjn Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n",
+      "Querying stamp from ALERCEBroker\n",
+      "Object ID:  ZTF25acdduhl\n",
+      "\n",
+      "--- ALERT ZTF25acdduhl Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "✅ Host galaxy\n",
+      "✅ Detections & stamp\n",
+      "-----------------------------\n",
+      "\n",
+      "NEW ALERT FOUND!\n",
+      "Querying detections from ALERCEBroker\n",
+      "Object ID:  ZTF25acdduhl\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  39%|███▉      | 22/56 [00:28<01:13,  2.15s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Querying stamp from ALERCEBroker\n",
+      "Object ID:  ZTF25acdfchc\n",
+      "\n",
+      "--- ALERT ZTF25acdfchc Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "✅ Host galaxy\n",
+      "✅ Detections & stamp\n",
+      "-----------------------------\n",
+      "\n",
+      "NEW ALERT FOUND!\n",
+      "Querying detections from ALERCEBroker\n",
+      "Object ID:  ZTF25acdfchc\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  43%|████▎     | 24/56 [00:34<01:20,  2.51s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdfchc Progress ---\n",
+      "⬜ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Already in DB\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  45%|████▍     | 25/56 [00:35<01:00,  1.96s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdhuok Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  46%|████▋     | 26/56 [00:36<00:47,  1.58s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdhuol Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  48%|████▊     | 27/56 [00:36<00:38,  1.33s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdiyrh Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  50%|█████     | 28/56 [00:37<00:32,  1.15s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdkzig Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  52%|█████▏    | 29/56 [00:38<00:27,  1.01s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdqaff Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  54%|█████▎    | 30/56 [00:39<00:23,  1.10it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdqaff Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  55%|█████▌    | 31/56 [00:39<00:21,  1.18it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdwwni Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  57%|█████▋    | 32/56 [00:40<00:19,  1.24it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdwzgi Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  59%|█████▉    | 33/56 [00:41<00:17,  1.28it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accrdul Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  61%|██████    | 34/56 [00:41<00:16,  1.34it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accyldc Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  62%|██████▎   | 35/56 [00:42<00:15,  1.38it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accylde Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  64%|██████▍   | 36/56 [00:43<00:14,  1.39it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdxhgh Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  66%|██████▌   | 37/56 [00:43<00:13,  1.42it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accwijh Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  68%|██████▊   | 38/56 [00:44<00:12,  1.41it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acczdtj Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  70%|██████▉   | 39/56 [00:45<00:12,  1.42it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acddcso Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n",
+      "Querying stamp from ALERCEBroker\n",
+      "Object ID:  ZTF25acdesme\n",
+      "\n",
+      "--- ALERT ZTF25acdesme Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "✅ Host galaxy\n",
+      "✅ Detections & stamp\n",
+      "-----------------------------\n",
+      "\n",
+      "NEW ALERT FOUND!\n",
+      "Querying detections from ALERCEBroker\n",
+      "Object ID:  ZTF25acdesme\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  73%|███████▎  | 41/56 [00:51<00:24,  1.65s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdinfk Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  75%|███████▌  | 42/56 [00:51<00:19,  1.36s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdldwi Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  77%|███████▋  | 43/56 [00:52<00:15,  1.15s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdzrty Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  79%|███████▊  | 44/56 [00:53<00:12,  1.02s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25aceakpi Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n",
+      "Querying stamp from ALERCEBroker\n",
+      "Object ID:  ZTF24aazeees\n",
+      "\n",
+      "--- ALERT ZTF24aazeees Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "✅ Host galaxy\n",
+      "✅ Detections & stamp\n",
+      "-----------------------------\n",
+      "\n",
+      "NEW ALERT FOUND!\n",
+      "Querying detections from ALERCEBroker\n",
+      "Object ID:  ZTF24aazeees\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  82%|████████▏ | 46/56 [00:59<00:18,  1.84s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accstfa Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  84%|████████▍ | 47/56 [00:59<00:13,  1.49s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accwhee Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  86%|████████▌ | 48/56 [01:00<00:10,  1.26s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acddbpa Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  88%|████████▊ | 49/56 [01:01<00:07,  1.08s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdqcar Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  89%|████████▉ | 50/56 [01:02<00:05,  1.04it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accwqaq Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  91%|█████████ | 51/56 [01:02<00:04,  1.13it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdemhp Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  93%|█████████▎| 52/56 [01:03<00:03,  1.22it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdhnei Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n",
+      "Querying stamp from ALERCEBroker\n",
+      "Object ID:  ZTF25acdicrb\n",
+      "\n",
+      "--- ALERT ZTF25acdicrb Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "✅ Host galaxy\n",
+      "✅ Detections & stamp\n",
+      "-----------------------------\n",
+      "\n",
+      "NEW ALERT FOUND!\n",
+      "Querying detections from ALERCEBroker\n",
+      "Object ID:  ZTF25acdicrb\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  96%|█████████▋| 54/56 [01:08<00:03,  1.58s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdicrb Progress ---\n",
+      "⬜ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Already in DB\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:  98%|█████████▊| 55/56 [01:09<00:01,  1.32s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdjkws Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...: 100%|██████████| 56/56 [01:10<00:00,  1.25s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdksaz Progress ---\n",
+      "✅ Already in DB\n",
+      "⬜ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: Not observable tonight\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "self.receive_alerts()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "NameError",
+     "evalue": "name 'alerce_tbl_recent' is not defined",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[31m---------------------------------------------------------------------------\u001b[39m",
+      "\u001b[31mNameError\u001b[39m                                 Traceback (most recent call last)",
+      "\u001b[36mCell\u001b[39m\u001b[36m \u001b[39m\u001b[32mIn[6]\u001b[39m\u001b[32m, line 1\u001b[39m\n\u001b[32m----> \u001b[39m\u001b[32m1\u001b[39m \u001b[43malerce_tbl_recent\u001b[49m\n",
+      "\u001b[31mNameError\u001b[39m: name 'alerce_tbl_recent' is not defined"
+     ]
+    }
+   ],
+   "source": [
+    "alerce_tbl_recent\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "NameError",
+     "evalue": "name 'alerce_tbl' is not defined",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[31m---------------------------------------------------------------------------\u001b[39m",
+      "\u001b[31mNameError\u001b[39m                                 Traceback (most recent call last)",
+      "\u001b[36mCell\u001b[39m\u001b[36m \u001b[39m\u001b[32mIn[7]\u001b[39m\u001b[32m, line 1\u001b[39m\n\u001b[32m----> \u001b[39m\u001b[32m1\u001b[39m alerce_tbl_recent = \u001b[43malerce_tbl\u001b[49m[(alerce_tbl[\u001b[33m'\u001b[39m\u001b[33mmjdstarthist\u001b[39m\u001b[33m'\u001b[39m] > mjd_start) & (alerce_tbl[\u001b[33m'\u001b[39m\u001b[33mmeandec\u001b[39m\u001b[33m'\u001b[39m] < \u001b[38;5;28mself\u001b[39m.config.decl_upper) & (alerce_tbl[\u001b[33m'\u001b[39m\u001b[33mmeandec\u001b[39m\u001b[33m'\u001b[39m] > \u001b[38;5;28mself\u001b[39m.config.decl_lower)]\n\u001b[32m      2\u001b[39m \u001b[38;5;28mprint\u001b[39m(\u001b[33mf\u001b[39m\u001b[33m\"\u001b[39m\u001b[38;5;132;01m{\u001b[39;00m\u001b[38;5;28mlen\u001b[39m(alerce_tbl_recent)\u001b[38;5;132;01m}\u001b[39;00m\u001b[33m new alerts are found!\u001b[39m\u001b[33m\"\u001b[39m)\n\u001b[32m      3\u001b[39m \u001b[38;5;28;01mfor\u001b[39;00m alerce_alert \u001b[38;5;129;01min\u001b[39;00m tqdm(alerce_tbl_recent, desc = \u001b[33m'\u001b[39m\u001b[33mChecking alerts...\u001b[39m\u001b[33m'\u001b[39m):\n",
+      "\u001b[31mNameError\u001b[39m: name 'alerce_tbl' is not defined"
+     ]
+    }
+   ],
+   "source": [
+    "        alerce_tbl_recent = alerce_tbl[(alerce_tbl['mjdstarthist'] > mjd_start) & (alerce_tbl['meandec'] < self.config.decl_upper) & (alerce_tbl['meandec'] > self.config.decl_lower)]\n",
+    "        print(f\"{len(alerce_tbl_recent)} new alerts are found!\")\n",
+    "        for alerce_alert in tqdm(alerce_tbl_recent, desc = 'Checking alerts...'):\n",
+    "            \n",
+    "            alert_instance = Alert(\n",
+    "                cent_ra = float(alerce_alert['meanra']),\n",
+    "                cent_dec = float(alerce_alert['meandec']),\n",
+    "                objname = str(alerce_alert['oid']),\n",
+    "                alert_time = Time(alerce_alert['firstmjd'], format='mjd'),\n",
+    "                )\n",
+    "            \n",
+    "            alert_instance = self.check_alert(alert_instance)\n",
+    "            if not alert_instance is None:\n",
+    "                print(\"NEW ALERT FOUND!\") \n",
+    "                break\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Querying alerts from ALERCEBroker\n",
+      "===== Configuration =====\n",
+      "classifier  : stamp_classifier\n",
+      "classname   : SN\n",
+      "ndetection  : None\n",
+      "probability : 0.5\n",
+      "firstmjd    : None\n",
+      "lastmjd     : 60622.12345\n",
+      "ra          : None\n",
+      "dec         : None\n",
+      "radius      : None\n",
+      "page        : 1\n",
+      "page_size   : 10\n",
+      "order_by    : firstmjd\n",
+      "order_mode  : DESC\n",
+      "max_retries : 3\n",
+      "retry_delay : 5\n",
+      "Query finished: elapsed time=  22.20385503768921 seconds\n",
+      "Number of alerts:  193\n"
+     ]
+    }
+   ],
+   "source": [
+    "        mjd_start = Time.now().mjd - self.config.search_days\n",
+    "        \n",
+    "        # ALERCE Alert broker. (Receive -> Update DB -> Trigger)\n",
+    "        alerce_tbl = self.alerce.query_objects(\n",
+    "            class_name = self.alerce.config.classname,\n",
+    "            probability = self.alerce.config.probability,\n",
+    "            firstmjd = mjd_start,\n",
+    "            lastmjd = None,\n",
+    "            page = 1,\n",
+    "            page_size = 1000000\n",
+    "        )\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "56 new alerts are found!\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   2%|▏         | 1/56 [00:01<00:55,  1.00s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accstfa Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   4%|▎         | 2/56 [00:01<00:45,  1.18it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25accytaa Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   5%|▌         | 3/56 [00:02<00:41,  1.28it/s]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acddcso Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "⬜ Host galaxy\n",
+      "⬜ Detections & stamp\n",
+      "⚠️ Stopped: No host galaxy within radius\n",
+      "-----------------------------\n",
+      "\n",
+      "Querying stamp from ALERCEBroker\n",
+      "Object ID:  ZTF25acdduhl\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Checking alerts...:   5%|▌         | 3/56 [00:08<02:25,  2.74s/it]"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- ALERT ZTF25acdduhl Progress ---\n",
+      "✅ Already in DB\n",
+      "✅ Visibility (now/tonight)\n",
+      "✅ Host galaxy\n",
+      "✅ Detections & stamp\n",
+      "-----------------------------\n",
+      "\n",
+      "NEW ALERT FOUND!\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "        alerce_tbl_recent = alerce_tbl[(alerce_tbl['mjdstarthist'] > mjd_start) & (alerce_tbl['meandec'] < self.config.decl_upper) & (alerce_tbl['meandec'] > self.config.decl_lower)]\n",
+    "        print(f\"{len(alerce_tbl_recent)} new alerts are found!\")\n",
+    "        for alerce_alert in tqdm(alerce_tbl_recent, desc = 'Checking alerts...'):\n",
+    "            \n",
+    "            alert_instance = Alert(\n",
+    "                cent_ra = float(alerce_alert['meanra']),\n",
+    "                cent_dec = float(alerce_alert['meandec']),\n",
+    "                objname = str(alerce_alert['oid']),\n",
+    "                alert_time = Time(alerce_alert['firstmjd'], format='mjd'),\n",
+    "                )\n",
+    "            \n",
+    "            alert_instance = self.check_alert(alert_instance)\n",
+    "            if not alert_instance is None:\n",
+    "                print(\"NEW ALERT FOUND!\") \n",
+    "                break\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "🔷 ALERT SUMMARY\n",
+       "────────────────────────────\n",
+       "  • alert_id                  = f7959705-4799-4a68-8dc3-00f992ea8496\n",
+       "  • objname                   = ZTF25acdduhl\n",
+       "  • cent_ra                   = 332.53732419861973\n",
+       "  • cent_dec                  = -24.875381879722156\n",
+       "  • radius                    = 0.0\n",
+       "  • tile_id                   = ['T11260']\n",
+       "  • tile_ra                   = [333.17647058823525]\n",
+       "  • tile_dec                  = [-24.622641509433965]\n",
+       "────────────────────────────"
+      ]
+     },
+     "execution_count": 10,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "alert_instance"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Querying detections from ALERCEBroker\n",
+      "Object ID:  ZTF25acdduhl\n"
+     ]
+    }
+   ],
+   "source": [
+    "\n",
+    "                detection_tbl = self.alerce.query_detections(alert_instance.objname)\n",
+    "                if 'magpsf_cordd' in detection_tbl.columns:\n",
+    "                    magnitude = detection_tbl['magpsf_corr']\n",
+    "                else:\n",
+    "                    magnitude = detection_tbl['magpsf']\n",
+    "                try:\n",
+    "                    detection_tbl = detection_tbl[magnitude.mask]\n",
+    "                except:\n",
+    "                    pass\n",
+    "                mjd_now = Time.now().mjd\n",
+    "                closest_idx = np.argmin(np.abs(detection_tbl['mjd'] - mjd_now))\n",
+    "                magnitude = magnitude[closest_idx]\n",
+    "                distance_modulus = 5 * np.log10(float(alert_instance.host_galaxy_distance)) +25\n",
+    "                alert_instance.mag_expected = round(float(magnitude),2)\n",
+    "                alert_instance.absmag_expected = round(float(magnitude - distance_modulus),2)\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "🔷 ALERT SUMMARY\n",
+       "────────────────────────────\n",
+       "  • alert_id                  = f7959705-4799-4a68-8dc3-00f992ea8496\n",
+       "  • objname                   = ZTF25acdduhl\n",
+       "  • cent_ra                   = 332.53732419861973\n",
+       "  • cent_dec                  = -24.875381879722156\n",
+       "  • radius                    = 0.0\n",
+       "  • tile_id                   = ['T11260']\n",
+       "  • tile_ra                   = [333.17647058823525]\n",
+       "  • tile_dec                  = [-24.622641509433965]\n",
+       "────────────────────────────"
+      ]
+     },
+     "execution_count": 12,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "alert_instance"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "🔷 ALERT INFORMATION SUMMARY\n",
+      "────────────────────────────\n",
+      "  • alert_id                  = f7959705-4799-4a68-8dc3-00f992ea8496\n",
+      "  • alert_time                = 60986.16766199982\n",
+      "  • create_time               = 2025-11-13 08:54:46.683554\n",
+      "  • exptime                   = 100.0\n",
+      "  • count                     = 3\n",
+      "  • obsmode                   = Spec\n",
+      "  • filter_                   = None\n",
+      "  • specmode                  = None\n",
+      "  • ntelescope                = None\n",
+      "  • priority                  = 50\n",
+      "  • weight                    = 1\n",
+      "  • binning                   = 1\n",
+      "  • gain                      = 2750\n",
+      "  • objtype                   = Request\n",
+      "  • is_ToO                    = False\n",
+      "  • is_rapid_ToO              = False\n",
+      "  • note                      = None\n",
+      "  • host_galaxy               = None\n",
+      "  • host_galaxy_distance      = 308.4825155883509\n",
+      "  • host_galaxy_separation    = 6.389198857416872\n",
+      "  • expected_mag              = 19.39\n",
+      "  • absmag_expected           = -18.06\n",
+      "────────────────────────────\n"
+     ]
+    }
+   ],
+   "source": [
+    "alert_instance.info"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "🔷 ALERT STATUS SUMMARY\n",
+      "────────────────────────────\n",
+      "  • alert_id                  = f7959705-4799-4a68-8dc3-00f992ea8496\n",
+      "  • status_id                 = 32875e1f-cda3-448f-8ce6-0e81565b90eb\n",
+      "  • is_triggered              = False\n",
+      "  • is_observed               = False\n",
+      "  • is_processed              = False\n",
+      "  • is_completed              = False\n",
+      "  • trigger_time              = None\n",
+      "  • update_time               = 2025-11-13 08:54:46.683701\n",
+      "────────────────────────────\n"
+     ]
+    }
+   ],
+   "source": [
+    "alert_instance.status"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "IndentationError",
+     "evalue": "unexpected indent (<ipython-input-15-0eecec1f28bc>, line 1)",
+     "output_type": "error",
+     "traceback": [
+      "  \u001b[36mCell\u001b[39m\u001b[36m \u001b[39m\u001b[32mIn[15]\u001b[39m\u001b[32m, line 1\u001b[39m\n\u001b[31m    \u001b[39m\u001b[31minput_dict = alert_instance.__dict__\u001b[39m\n    ^\n\u001b[31mIndentationError\u001b[39m\u001b[31m:\u001b[39m unexpected indent\n"
+     ]
+    }
+   ],
+   "source": [
+    "        input_dict = alert_instance.__dict__\n",
+    "        # If isinstance(Time), convert to isot\n",
+    "\\\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "        input_dict = alert_instance.__dict__\n",
+    "        # If isinstance(Time), convert to isot\n",
+    "\n",
+    "\n",
+    "\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "{'alert_id': 'f7959705-4799-4a68-8dc3-00f992ea8496',\n",
+       " 'alert_time': <Time object: scale='utc' format='mjd' value=60986.16766199982>,\n",
+       " 'create_time': <Time object: scale='utc' format='datetime' value=2025-11-13 08:54:46.683554>,\n",
+       " 'exptime': 100.0,\n",
+       " 'count': 3,\n",
+       " 'obsmode': 'Spec',\n",
+       " 'filter_': None,\n",
+       " 'specmode': None,\n",
+       " 'ntelescope': None,\n",
+       " 'priority': 50,\n",
+       " 'weight': 1,\n",
+       " 'binning': 1,\n",
+       " 'gain': 2750,\n",
+       " 'objtype': 'Request',\n",
+       " 'is_rapid_ToO': False,\n",
+       " 'is_ToO': False,\n",
+       " 'note': 'None',\n",
+       " 'host_galaxy': 'None',\n",
+       " 'host_galaxy_distance': 308.4825155883509,\n",
+       " 'host_galaxy_separation': 6.389198857416872,\n",
+       " 'expected_mag': 19.39,\n",
+       " 'absmag_expected': -18.06,\n",
+       " 'status_id': '32875e1f-cda3-448f-8ce6-0e81565b90eb',\n",
+       " 'is_triggered': False,\n",
+       " 'is_observed': False,\n",
+       " 'is_processed': False,\n",
+       " 'is_completed': False,\n",
+       " 'trigger_time': None,\n",
+       " 'update_time': <Time object: scale='utc' format='datetime' value=2025-11-13 08:54:46.683701>,\n",
+       " 'cent_ra': 332.53732419861973,\n",
+       " 'cent_dec': -24.875381879722156,\n",
+       " 'objname': 'ZTF25acdduhl',\n",
+       " 'radius': 0.0,\n",
+       " 'SDS_connector': <bridge.connector.sds_connector.SDSConnector at 0x7fabca8b32d0>,\n",
+       " 'tile_id': ['T11260'],\n",
+       " 'tile_ra': [333.17647058823525],\n",
+       " 'tile_dec': [-24.622641509433965],\n",
+       " 'target': Targets[n_targets = 1]}"
+      ]
+     },
+     "execution_count": 17,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "input_dict\n",
+    "\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "        input_dict = {key: Time(value).isot if isinstance(value, (Time, datetime.datetime)) else value for key, value in input_dict.items()}\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "{'alert_id': 'f7959705-4799-4a68-8dc3-00f992ea8496',\n",
+       " 'alert_time': '2025-11-07T04:01:25.997',\n",
+       " 'create_time': '2025-11-13T08:54:46.684',\n",
+       " 'exptime': 100.0,\n",
+       " 'count': 3,\n",
+       " 'obsmode': 'Spec',\n",
+       " 'filter_': None,\n",
+       " 'specmode': None,\n",
+       " 'ntelescope': None,\n",
+       " 'priority': 50,\n",
+       " 'weight': 1,\n",
+       " 'binning': 1,\n",
+       " 'gain': 2750,\n",
+       " 'objtype': 'Request',\n",
+       " 'is_rapid_ToO': False,\n",
+       " 'is_ToO': False,\n",
+       " 'note': 'None',\n",
+       " 'host_galaxy': 'None',\n",
+       " 'host_galaxy_distance': 308.4825155883509,\n",
+       " 'host_galaxy_separation': 6.389198857416872,\n",
+       " 'expected_mag': 19.39,\n",
+       " 'absmag_expected': -18.06,\n",
+       " 'status_id': '32875e1f-cda3-448f-8ce6-0e81565b90eb',\n",
+       " 'is_triggered': False,\n",
+       " 'is_observed': False,\n",
+       " 'is_processed': False,\n",
+       " 'is_completed': False,\n",
+       " 'trigger_time': None,\n",
+       " 'update_time': '2025-11-13T08:54:46.684',\n",
+       " 'cent_ra': 332.53732419861973,\n",
+       " 'cent_dec': -24.875381879722156,\n",
+       " 'objname': 'ZTF25acdduhl',\n",
+       " 'radius': 0.0,\n",
+       " 'SDS_connector': <bridge.connector.sds_connector.SDSConnector at 0x7fabca8b32d0>,\n",
+       " 'tile_id': ['T11260'],\n",
+       " 'tile_ra': [333.17647058823525],\n",
+       " 'tile_dec': [-24.622641509433965],\n",
+       " 'target': Targets[n_targets = 1]}"
+      ]
+     },
+     "execution_count": 19,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "\n",
+    "input_dict\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "        input_dict = {key: value for key, value in input_dict.items() if (np.isscalar(value)) or (value is None)}\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "{'alert_id': 'f7959705-4799-4a68-8dc3-00f992ea8496',\n",
+       " 'alert_time': '2025-11-07T04:01:25.997',\n",
+       " 'create_time': '2025-11-13T08:54:46.684',\n",
+       " 'exptime': 100.0,\n",
+       " 'count': 3,\n",
+       " 'obsmode': 'Spec',\n",
+       " 'filter_': None,\n",
+       " 'specmode': None,\n",
+       " 'ntelescope': None,\n",
+       " 'priority': 50,\n",
+       " 'weight': 1,\n",
+       " 'binning': 1,\n",
+       " 'gain': 2750,\n",
+       " 'objtype': 'Request',\n",
+       " 'is_rapid_ToO': False,\n",
+       " 'is_ToO': False,\n",
+       " 'note': 'None',\n",
+       " 'host_galaxy': 'None',\n",
+       " 'host_galaxy_distance': 308.4825155883509,\n",
+       " 'host_galaxy_separation': 6.389198857416872,\n",
+       " 'expected_mag': 19.39,\n",
+       " 'absmag_expected': -18.06,\n",
+       " 'status_id': '32875e1f-cda3-448f-8ce6-0e81565b90eb',\n",
+       " 'is_triggered': False,\n",
+       " 'is_observed': False,\n",
+       " 'is_processed': False,\n",
+       " 'is_completed': False,\n",
+       " 'trigger_time': None,\n",
+       " 'update_time': '2025-11-13T08:54:46.684',\n",
+       " 'cent_ra': 332.53732419861973,\n",
+       " 'cent_dec': -24.875381879722156,\n",
+       " 'objname': 'ZTF25acdduhl',\n",
+       " 'radius': 0.0}"
+      ]
+     },
+     "execution_count": 21,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "\n",
+    "input_dict\n",
+    "\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "too",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.13"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

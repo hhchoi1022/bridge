@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "BRIDGE"                      # pip install BRIDGE
+version = "0.1.0"
+description = "BRIDGE: A toolkit for astronomical data analysis"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Hyeonho Choi", email = "your.email@example.com" }
+]
+dependencies = [
+  "numpy",
+  "astropy",
+  "photutils",
+  "sep",
+]
+
+[project.urls]
+Homepage = "https://github.com/hhchoi1022/BRIDGE"
+Documentation = "https://bridge.readthedocs.io/"

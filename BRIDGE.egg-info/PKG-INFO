@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: BRIDGE
+Version: 0.1.0
+Summary: BRIDGE: A toolkit for astronomical data analysis
+Author-email: Hyeonho Choi <your.email@example.com>
+Project-URL: Homepage, https://github.com/hhchoi1022/BRIDGE
+Project-URL: Documentation, https://bridge.readthedocs.io/
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: astropy
+Requires-Dist: photutils
+Requires-Dist: sep
+Dynamic: license-file
