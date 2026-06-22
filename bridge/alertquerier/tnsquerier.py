@@ -42,6 +42,8 @@ class TNSQuerier:
         self.bot_name = self.config.bot_name
         self.user_id = self.config.user_id
         self.user_pwd = self.config.user_pwd
+        self.min_request_interval = 1.0
+        self._last_request_time = 0.0
         
         self.base_url = "https://www.wis-tns.org"
         self.search_url = f"{self.base_url}/search"
@@ -413,6 +415,82 @@ class TNSQuerier:
         merged_df.to_csv(historyfile_path, index=False)
         if verbose:
             print(f"Updated history file: {historyfile_path}")
+
+    def _download_file(self, url: str, outpath: str, timeout: int = 60, verbose: bool = True):
+        outpath = Path(outpath)
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+        headers = {'User-Agent': self._set_tns_marker()}
+        data = {'api_key': self.api_key}
+
+        r = self._post_with_rate_limit(
+            url,
+            data=data,
+            stream=True,
+            timeout=timeout,
+            verbose=verbose
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(f"TNS download failed ({r.status_code}): {url}")
+
+        with open(outpath, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        if verbose:
+            print('File downloaded to: ', outpath)
+
+        return outpath
+
+
+    def _post_with_rate_limit(self, url, data, stream=False, timeout=60, verbose=True, max_retries=8):
+        """
+        POST request with polite retry on TNS 429 rate limits.
+        """
+        self._throttle()
+        last_response = None
+
+        for attempt in range(max_retries):
+            response = requests.post(
+                url,
+                headers=self.headers,
+                data=data,
+                stream=stream,
+                timeout=timeout
+            )
+            last_response = response
+
+            if response.status_code == 200:
+                return response
+
+            if response.status_code == 429:
+                reset = self._get_reset_time(response)
+
+                # fallback if reset header is absent
+                if reset is None:
+                    reset = min(60, 2 ** attempt)
+
+                wait_time = reset + 1
+
+                if verbose:
+                    print(f"TNS rate limit hit (429). Sleeping {wait_time} sec before retry...")
+
+                time.sleep(wait_time)
+                continue
+
+            # for other errors, fail immediately
+            raise RuntimeError(f"TNS request failed: {response.text}")
+
+        raise RuntimeError(
+            f"TNS request failed after {max_retries} retries: "
+            f"{last_response.text if last_response is not None else 'No response'}"
+        )
+
+    def _throttle(self):
+        dt = time.time() - self._last_request_time
+        if dt < self.min_request_interval:
+            time.sleep(self.min_request_interval - dt)
+        self._last_request_time = time.time()
 
     def _load_config(self, config_path):
         """

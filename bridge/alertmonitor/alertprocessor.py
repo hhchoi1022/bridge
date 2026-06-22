@@ -7,7 +7,7 @@ from astropy.table import vstack
 from astropy.coordinates import match_coordinates_sky
 from astropy.coordinates import SkyCoord
 import astropy.units as u
-from typing import Optional, Union
+from typing import Any, Optional, Union
 from astropy.io import ascii
 
 from concurrent.futures import ThreadPoolExecutor
@@ -30,31 +30,39 @@ def preprocess_worker(args):
     dark_img = None
     flat_img = None
     corrected_img = None
+    error = None
+
     try:
         bias_img = target_img.get_masterframe(imagetyp = 'BIAS', max_days = 1000)[0]
         dark_img = target_img.get_masterframe(imagetyp = 'DARK', max_days = 1000)[0]
         flat_img = target_img.get_masterframe(imagetyp = 'FLAT', max_days = 1000)[0]
         corrected_img = target_img.correct_bdf(bias_image = bias_img, dark_image = dark_img, flat_image = flat_img, save = True, verbose = False)
         
-        target_img.clear(verbose = False)
-        if bias_img is not None: bias_img.clear(verbose = False)
-        if dark_img is not None: dark_img.clear(verbose = False)
-        if flat_img is not None: flat_img.clear(verbose = False)
-        if clear:
-            if corrected_img is not None: corrected_img.clear(verbose = False)
-        return {"success": True, "image": corrected_img, "error": None, "function": "preprocess"}
-    
     except Exception as e:
-        target_img.clear(verbose = False)
-        if bias_img is not None: bias_img.clear(verbose = False)
-        if dark_img is not None: dark_img.clear(verbose = False)
-        if flat_img is not None: flat_img.clear(verbose = False)
-        if corrected_img is not None: corrected_img.clear(verbose = False)
-        return {"success": False, "image": target_img, "error": f"preprocess: {e}", "function": "preprocess"}
+        error = f"preprocess: {e}"
+
+    finally:
+        for obj in [
+            target_img,
+            bias_img,
+            dark_img,
+            flat_img]:
+            if obj is not None:
+                obj.clear(verbose=False)
+        if clear:
+            if corrected_img is not None: corrected_img.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = corrected_img
+        result_dict['error'] = error
+        result_dict['function'] = "preprocess"
+        return result_dict
 
 def platesolve_worker(args):
     target_img, clear = args
     corrected_img = None
+    error = None
+
     try:
         corrected_img = target_img.platesolve(
             overwrite=True,
@@ -63,39 +71,58 @@ def platesolve_worker(args):
             scamp_params=None
         )
         
-        target_img.clear(verbose=False)
-        if clear:
-            corrected_img.clear(verbose = False)
-        return {"success": True, "image": corrected_img, "error": None, "function": "platesolve"}
-    
     except Exception as e:
-        target_img.clear(verbose=False)
-        if corrected_img is not None: corrected_img.clear(verbose = False)
-        return {"success": False, "image": target_img, "error": f"platesolve: {e}", "function": "platesolve"}
+        error = f"platesolve: {e}"
+    
+    finally:
+        if clear:
+            if target_img is not None: target_img.clear(verbose=False)
+            if corrected_img is not None: corrected_img.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = corrected_img
+        result_dict['error'] = error
+        result_dict['function'] = "platesolve"
+        return result_dict
     
 def calculate_invalidmask_worker(args):
     target_img, clear, invalidmask_kwargs = args
-    target_invalidmask = None
-    try:
-        target_invalidmask = target_img.calculate_invalidmask(**invalidmask_kwargs)
-        
-        if clear:
-            target_img.clear(verbose=False)
-            if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-        return {"success": True, "image": target_img, "invalidmask": target_invalidmask, "error": None, "function": "calculate_invalidmask"}
+    target_ivpmask = None
+    error = None
 
+    try:
+        target_ivpmask = target_img.calculate_invalidmask(**invalidmask_kwargs)
+        
     except Exception as e:
-        target_img.clear(verbose=False)
-        if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-        return {"success": False, "image": target_img, "invalidmask": None, "error": f"calculate_invalidmask: {e}", "function": "calculate_invalidmask"}
+        error = f"calculate_invalidmask: {e}"
+    
+    finally:
+        if clear:
+            if target_img is not None: target_img.clear(verbose=False)
+            if target_ivpmask is not None: target_ivpmask.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['invalidmask'] = target_ivpmask
+        result_dict['error'] = error
+        result_dict['function'] = "calculate_invalidmask"
+        return result_dict
 
 def calculate_srcmask_worker(args):
     target_img, target_srcmask, ra, dec, radius_arcsec, clear, srcmask_kwargs = args
+    error = None
+
     # Mask circular region if coordinate is given
     if ra is not None and dec is not None and radius_arcsec is not None:
         try:
             target_srcmask = target_img.calculate_circularmask(target_srcmask = target_srcmask, 
-                                                               x_position = ra, y_position = dec, radius_arcsec = radius_arcsec, unit = 'coord', save = False, verbose = False, visualize = False, save_fig = False)
+                                                               x_position = ra, y_position = dec, 
+                                                               radius_arcsec = radius_arcsec, 
+                                                               unit = 'coord', 
+                                                               save = False, 
+                                                               verbose = False, 
+                                                               visualize = False, 
+                                                               save_fig = False)
         
         except Exception as e:
             target_srcmask = None
@@ -104,57 +131,78 @@ def calculate_srcmask_worker(args):
     try:
         target_srcmask = target_img.calculate_sourcemask(target_srcmask = target_srcmask, 
                                                          **srcmask_kwargs)
-        if clear:
-            target_img.clear(verbose=False)
-            if target_srcmask is not None: target_srcmask.clear(verbose=False)
-        return {"success": True, "image": target_img, "sourcemask": target_srcmask, "error": None, "function": "calculate_srcmask"}
-    
     except Exception as e:
-        target_img.clear(verbose=False)
-        if target_srcmask is not None: target_srcmask.clear(verbose=False)
-        return {"success": False, "image": target_img, "sourcemask": None, "error": f"calculate_srcmask: {e}", "function": "calculate_srcmask"}
+        error = f"calculate_srcmask: {e}"
+    
+    finally:
+        if clear:
+            if target_img is not None: target_img.clear(verbose=False)
+            if target_srcmask is not None: target_srcmask.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['sourcemask'] = target_srcmask
+        result_dict['error'] = error
+        result_dict['function'] = "calculate_srcmask"
+        return result_dict
     
 def calculate_bkgmap_worker(args):
-    target_img, target_srcmask, target_invalidmask, clear, bkgmap_kwargs = args
+    target_img, target_srcmask, target_ivpmask, clear, bkgmap_kwargs = args
     target_bkg = None
+    error = None
+
     try:
         target_bkg = target_img.calculate_bkg(target_srcmask = target_srcmask, 
-                                              target_ivpmask = target_invalidmask, 
+                                              target_ivpmask = target_ivpmask, 
                                               **bkgmap_kwargs)
+    
+    except Exception as e:
+        error = f"calculate_bkgmap: {e}"
+    
+    finally:
         if clear:
-            target_img.clear(verbose=False)
+            if target_img is not None: target_img.clear(verbose=False)
             if target_bkg is not None: target_bkg.clear(verbose=False)
             if target_srcmask is not None: target_srcmask.clear(verbose=False)
-            if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-        return {"success": True, "image": target_img, "bkgmap": target_bkg, "error": None, "target_srcmask": target_srcmask, "target_invalidmask": target_invalidmask, "function": "calculate_bkgmap"}
-    
-    except Exception as e:
-        target_img.clear(verbose=False)
-        if target_bkg is not None: target_bkg.clear(verbose=False)
-        if target_srcmask is not None: target_srcmask.clear(verbose=False)
-        if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-        return {"success": False, "image": target_img, "bkgmap": None, "error": f"calculate_bkgmap: {e}", "target_srcmask": target_srcmask, "target_invalidmask": target_invalidmask, "function": "calculate_bkgmap"}
+            if target_ivpmask is not None: target_ivpmask.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['invalidmask'] = target_ivpmask
+        result_dict['sourcemask'] = target_srcmask
+        result_dict['bkgmap'] = target_bkg
+        result_dict['error'] = error
+        result_dict['function'] = "calculate_bkgmap"
+        return result_dict
 
 def calculate_bkgrms_worker(args):
-    target_img, target_srcmask, target_invalidmask, clear, bkgrms_kwargs = args
+    target_img, target_srcmask, target_ivpmask, clear, bkgrms_kwargs = args
     target_bkgrms = None
+    error = None
+
     try:
         target_bkgrms = target_img.calculate_bkgrms(target_srcmask = target_srcmask, 
-                                                    target_ivpmask = target_invalidmask,
+                                                    target_ivpmask = target_ivpmask,
                                                     **bkgrms_kwargs)
-        if clear:
-            target_img.clear(verbose=False)
-            if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
-            if target_srcmask is not None: target_srcmask.clear(verbose=False)
-            if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-        return {"success": True, "image": target_img, "bkgrms": target_bkgrms, "error": None, "target_srcmask": target_srcmask, "target_invalidmask": target_invalidmask, "function": "calculate_bkgrms"}
     
     except Exception as e:
-        target_img.clear(verbose=False)
-        if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
-        if target_srcmask is not None: target_srcmask.clear(verbose=False)
-        if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-        return {"success": False, "image": target_img, "bkgrms": None, "error": f"calculate_bkgrms: {e}", "target_srcmask": target_srcmask, "target_invalidmask": target_invalidmask, "function": "calculate_bkgrms"}
+        error = f"calculate_bkgrms: {e}"
+    
+    finally:
+        if clear:
+            if target_img is not None: target_img.clear(verbose=False)
+            if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
+            if target_srcmask is not None: target_srcmask.clear(verbose=False)
+            if target_ivpmask is not None: target_ivpmask.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['invalidmask'] = target_ivpmask
+        result_dict['sourcemask'] = target_srcmask
+        result_dict['bkgrms'] = target_bkgrms
+        result_dict['error'] = error
+        result_dict['function'] = "calculate_bkgrms"
+        return result_dict
 
 def calculate_bkgrms_propagation_worker(args):
     target_img, target_bkg, clear, bkgrms_propagation_kwargs = args
@@ -163,6 +211,8 @@ def calculate_bkgrms_propagation_worker(args):
     mflat = None
     mflaterr = None
     target_bkgrms = None
+    error = None
+
     try:
         mbias = target_img.get_masterframe(imagetyp = 'BIAS', max_days = 100)[0]
         mdark = target_img.get_masterframe(imagetyp = 'DARK', max_days = 100)[0]
@@ -173,31 +223,34 @@ def calculate_bkgrms_propagation_worker(args):
                                                                      mflat = mflat,
                                                                      mflaterr = mflaterr,
                                                                      **bkgrms_propagation_kwargs)
-        
-        if mbias is not None: mbias.clear(verbose=False)
-        if mdark is not None: mdark.clear(verbose=False)
-        if mflat is not None: mflat.clear(verbose=False)
-        if mflaterr is not None: mflaterr.clear(verbose=False)
-        if clear:
-            target_img.clear(verbose=False)
-            if target_bkg is not None: target_bkg.clear(verbose=False)
-            if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
-
-        return {"success": True, "image": target_img, "bkgrms": target_bkgrms, "target_bkg": target_bkg, "error": None, "function": "calculate_bkgrms_propagation"}
     
     except Exception as e:
-        target_img.clear(verbose=False)
-        if target_bkg is not None: target_bkg.clear(verbose=False)
-        if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
+        error = f"calculate_bkgrms_propagation: {e}"
+    
+    finally:
         if mbias is not None: mbias.clear(verbose=False)
         if mdark is not None: mdark.clear(verbose=False)
         if mflat is not None: mflat.clear(verbose=False)
         if mflaterr is not None: mflaterr.clear(verbose=False)
-        return {"success": False, "image": target_img, "bkgrms": None, "target_bkg": target_bkg, "error": f"calculate_bkgrms_propagation: {e}", "function": "calculate_bkgrms_propagation"}
+        
+        if clear:
+            if target_img is not None: target_img.clear(verbose=False)
+            if target_bkg is not None: target_bkg.clear(verbose=False)
+            if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['bkgmap'] = target_bkg
+        result_dict['bkgrms'] = target_bkgrms
+        result_dict['error'] = error
+        result_dict['function'] = "calculate_bkgrms_propagation"
+        return result_dict
     
 def photometry_worker(args):
     target_img, target_bkg, target_bkgrms, target_mask, sex_params, clear, photometry_kwargs = args
     target_catalog = None
+    error = None
+    
     try:
         target_catalog = target_img.photometry_sex(
             target_bkg = target_bkg,
@@ -205,86 +258,102 @@ def photometry_worker(args):
             target_mask = target_mask, 
             sex_params = sex_params, 
             **photometry_kwargs)
-        
+            
+    except Exception as e:
+        error = f"photometry: {e}"
+
+    finally:
         if clear:
-            target_img.clear(verbose=False)
+            if target_img is not None: target_img.clear(verbose=False)
             if target_bkg is not None: target_bkg.clear(verbose=False)
             if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
             if target_mask is not None: target_mask.clear(verbose=False)
             if target_catalog is not None: target_catalog.clear(verbose=False)
-        return {"success": True, "image": target_img, "catalog": target_catalog, "error": None, "target_bkg": target_bkg, "target_bkgrms": target_bkgrms, "target_mask": target_mask, "function": "photometry"}
-    except Exception as e:
-        target_img.clear(verbose=False)
-        if target_bkg is not None: target_bkg.clear(verbose=False)
-        if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
-        if target_mask is not None: target_mask.clear(verbose=False)
-        if target_catalog is not None: target_catalog.clear(verbose=False)
-        return {"success": False, "image": target_img, "catalog": None, "error": f"photometry: {e}", "target_bkg": target_bkg, "target_bkgrms": target_bkgrms, "target_mask": target_mask, "function": "photometry"}
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['bkgmap'] = target_bkg
+        result_dict['bkgrms'] = target_bkgrms
+        result_dict['mask'] = target_mask
+        result_dict['catalog'] = target_catalog
+        result_dict['error'] = error
+        result_dict['function'] = "photometry"
+        return result_dict
             
 def photometric_calibration_worker(args):
-    target_img, target_catalog, clear, photometric_calibration_kwargs = args
+    target_img, target_catalog, ra, dec, clear, photometric_calibration_kwargs = args
     photcal_kwargs = photometric_calibration_kwargs.copy()
-        
-    if target_img.filter.startswith('m'):
-        photcal_kwargs['mag_lower'] = photcal_kwargs['mag_lower_MB']
-        photcal_kwargs['mag_upper'] = photcal_kwargs['mag_upper_MB']
-    else:
-        photcal_kwargs['mag_lower'] = photcal_kwargs['mag_lower_BB']
-        photcal_kwargs['mag_upper'] = photcal_kwargs['mag_upper_BB']
-    # Remove mag_lower_BB, mag_upper_BB, mag_lower_MB, mag_upper_MB
-    photcal_kwargs.pop('mag_lower_BB', None)
-    photcal_kwargs.pop('mag_upper_BB', None)
-    photcal_kwargs.pop('mag_lower_MB', None)
-    photcal_kwargs.pop('mag_upper_MB', None)
-    
-    target_refcatalog = None
+    target_catalog_ref = None
+    error = None
+
     try:
-        target_img, target_catalog, target_refcatalog, _ = target_img.photometric_calibration(
+        if target_img.filter in photcal_kwargs['mag_range_dict']:
+            photcal_kwargs['mag_lower'] = photcal_kwargs['mag_range_dict'][target_img.filter][0]
+            photcal_kwargs['mag_upper'] = photcal_kwargs['mag_range_dict'][target_img.filter][1]
+        else:
+            photcal_kwargs['mag_lower'] = photcal_kwargs['mag_range_default'][0]
+            photcal_kwargs['mag_upper'] = photcal_kwargs['mag_range_default'][1]
+        # Remove mag_lower_BB, mag_upper_BB, mag_lower_MB, mag_upper_MB
+        photcal_kwargs.pop('mag_range_dict', None)
+        photcal_kwargs.pop('mag_range_default', None)
+        photcal_kwargs['ra_deg'] = ra
+        photcal_kwargs['dec_deg'] = dec
+        target_img, target_catalog, target_catalog_ref, _ = target_img.photometric_calibration(
             target_catalog = target_catalog,
             **photcal_kwargs)
         
-        if clear:
-            _ = None
-            target_img.clear(verbose=False)
-            if target_catalog is not None: target_catalog.clear(verbose=False)
-            if target_refcatalog is not None: target_refcatalog.clear(verbose=False)
-        return {"success": True, "image": target_img, "refcatalog": target_refcatalog, "error": None, "target_catalog": target_catalog, "function": "photometric_calibration"}
     except Exception as e:
-        _ = None
-        target_img.clear(verbose=False)
-        if target_catalog is not None: target_catalog.clear(verbose=False)
-        if target_refcatalog is not None: target_refcatalog.clear(verbose=False)
-        return {"success": False, "image": target_img, "refcatalog": None, "error": f"photometric_calibration: {e}", "target_catalog": target_catalog, "function": "photometric_calibration"}
+        error = f"photometric_calibration: {e}"
+
+    finally:
+        if clear:
+            if target_img is not None: target_img.clear(verbose=False)
+            if target_catalog is not None: target_catalog.clear(verbose=False)
+            if target_catalog_ref is not None: target_catalog_ref.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['catalog'] = target_catalog
+        result_dict['catalog_ref'] = target_catalog_ref
+        result_dict['error'] = error
+        result_dict['function'] = "photometric_calibration"
+        return result_dict
 
 def forced_photometry_worker(args):
     target_img, target_bkg, target_bkgrms, x_arr, y_arr, unit, clear, forced_photometry_kwargs = args
+
     target_forced_catalog = None
+    error = None
+
     try:
         target_forced_catalog = target_img.photometry_forced_circular(
-            x_arr = x_arr,
-            y_arr = y_arr,
-            unit = unit,
-            target_bkg = target_bkg,
-            target_bkgrms = target_bkgrms,
-            **forced_photometry_kwargs)
-        target_forced_catalog.apply_zp(
-            target_img = target_img,
-            save = forced_photometry_kwargs['save'],
-            verbose = False)
-        
+            x_arr=x_arr,
+            y_arr=y_arr,
+            unit=unit,
+            target_bkg=target_bkg,
+            target_bkgrms=target_bkgrms,
+            **forced_photometry_kwargs,
+        )
+
+    except Exception as e:
+        error = f"forced_photometry: {e}"
+
+    finally:
         if clear:
-            target_img.clear(verbose=False)
+            if target_img is not None: target_img.clear(verbose=False)
             if target_bkg is not None: target_bkg.clear(verbose=False)
             if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
             if target_forced_catalog is not None: target_forced_catalog.clear(verbose=False)
-        return {"success": True, "image": target_img, "catalog": target_forced_catalog, "error": None, "function": "forced_photometry_worker"}
-    except Exception as e:
-        target_img.clear(verbose=False)
-        if target_bkg is not None: target_bkg.clear(verbose=False)
-        if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
-        if target_forced_catalog is not None: target_forced_catalog.clear(verbose=False)
-        return {"success": False, "image": target_img, "catalog": None, "error": f"forced_photometry: {e}", "function": "forced_photometry_worker"}
-    
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['bkgmap'] = target_bkg
+        result_dict['bkgrms'] = target_bkgrms
+        result_dict['catalog_forced'] = target_forced_catalog
+        result_dict['error'] = error
+        result_dict['function'] = "forced_photometry"
+        return result_dict
+        
 def tractor_photometry_worker(args):
     target_imgpathlist, target_filterlist, target_refcatalogpathlist, id_, target_ra, target_dec, hostinfo_dict, clear, tractor_photometry_kwargs = args
     runner = Tract7DTRunner(
@@ -429,284 +498,485 @@ def tractor_photometry_worker(args):
         return {"success": False, "result": None, "error": f"tractor_photometry: {e}", "function": "tractor_photometry"}
     
 def pipeline_worker_before_stacking(args):
-    target_img, ra, dec, clear, config = args
+    target_img, reference_img, ra, dec, clear, config = args
+    error = None
 
+    # Image variables
+    target_ivpmask = None
     target_srcmask = None
     target_bkg = None
-    target_bkgrms = None
+    target_bkgrms = None    
+    
+    # Photometry variables
     target_catalog = None
-    target_refcatalog = None
-    target_invalidmask = None
-    target_mask = None
+    target_catalog_ref = None
+    target_catalog_forced = None
+    
+    # DIA variables
+    science_img = None
+    reference_sub_img = None
+    subtracted_img = None
+    subtracted_catalog = None
+    candidate_catalog = None
+    transient_catalog = None
+    subtracted_catalog_forced = None
     try:
-        if config.do_preprocess:
+        # Preprocessing
+        if config.single_process['do_preprocess']:
             preprocess_args = [target_img, False]
             result_preprocess = preprocess_worker(preprocess_args)
-            target_img = result_preprocess["image"]
             if not result_preprocess["success"]:
                 raise RuntimeError(result_preprocess["error"])
+            target_img = result_preprocess["image"]
         
-        if config.do_platesolve:
+        # Platesolving
+        if config.single_process['do_platesolve']:
             platesolve_args = [target_img, False]
             result_platesolve = platesolve_worker(platesolve_args)
-            target_img = result_platesolve["image"]
             if not result_platesolve["success"]:
                 raise RuntimeError(result_platesolve["error"])
+            target_img = result_platesolve["image"]
         
-        if config.do_calculate_sourcemask:
+        # Calculating invalidmask
+        if config.single_process['do_calculate_invalidmask']:
+            invalidmask_args = [target_img, False, config.invalidmask]
+            result_invalidmask = calculate_invalidmask_worker(invalidmask_args)
+            if not result_invalidmask["success"]:
+                raise RuntimeError(result_invalidmask["error"])
+            target_ivpmask = result_invalidmask["invalidmask"]
+        
+        # Calculating sourcemask
+        if config.single_process['do_calculate_sourcemask']:
             srcmask_args = [target_img, None, ra, dec, config.circularmask['radius_arcsec'], False, config.sourcemask]
             result_sourcemask = calculate_srcmask_worker(srcmask_args)
-            target_img = result_sourcemask["image"]
-            target_srcmask = result_sourcemask["sourcemask"]
             if not result_sourcemask["success"]:
                 raise RuntimeError(result_sourcemask["error"])
+            target_srcmask = result_sourcemask["sourcemask"]
         
-        if config.do_calculate_bkgmap:
-            bkgmap_args = [target_img, target_srcmask, None, False, config.bkgmap]
+        # Calculating bkgmap
+        if config.single_process['do_calculate_bkgmap']:
+            bkgmap_args = [target_img, target_srcmask, target_ivpmask, False, config.bkgmap]
             result_bkgmap = calculate_bkgmap_worker(bkgmap_args)
-            target_img = result_bkgmap["image"]
-            target_bkg = result_bkgmap["bkgmap"]
-            target_srcmask = result_bkgmap["target_srcmask"]
-            target_invalidmask = result_bkgmap["target_invalidmask"]
             if not result_bkgmap["success"]:
                 raise RuntimeError(result_bkgmap["error"])
-            
-        if config.do_calculate_bkgrms:
-            if config.do_calculate_bkgrms_from_propagation:
+            target_bkg = result_bkgmap["bkgmap"]
+        
+        # Calculating bkgrms
+        if config.single_process['do_calculate_bkgrms']:
+            # For single frame images, bkgrms can be calculated from error propagation of masterframes & bkgmap
+            if config.single_process['do_calculate_bkgrms_from_propagation']:
                 bkgrms_kwargs = config.bkgrms.copy()
                 bkgrms_kwargs.pop('filter_size', None)
                 bkgrms_kwargs.pop('box_size', None)
                 bkgrms_args = [target_img, target_bkg, False, bkgrms_kwargs]
                 result_bkgrms = calculate_bkgrms_propagation_worker(bkgrms_args)
-                target_bkg = result_bkgrms["target_bkg"]    
             else:
-                bkgrms_args = [target_img, target_srcmask, target_invalidmask, False, config.bkgrms]
-                result_bkgrms = calculate_bkgrms_worker(bkgrms_args)
-                target_srcmask = result_bkgrms["target_srcmask"]
-                target_invalidmask = result_bkgrms["target_invalidmask"]
-            target_img = result_bkgrms["image"]
-            target_bkgrms = result_bkgrms["bkgrms"]
+                bkgrms_args = [target_img, target_srcmask, target_ivpmask, False, config.bkgrms]
+                result_bkgrms = calculate_bkgrms_worker(bkgrms_args)            
             if not result_bkgrms["success"]:
                 raise RuntimeError(result_bkgrms["error"])
+            target_bkgrms = result_bkgrms["bkgrms"]
         
-        if config.do_photometry:
-            photometry_args = [target_img, target_bkg, target_bkgrms, None, None, True, config.photometry]
+        # Photometry
+        if config.single_process['do_photometry']:
+            photometry_args = [target_img, target_bkg, target_bkgrms, None, None, False, config.photometry]
             result_photometry = photometry_worker(photometry_args)
-            target_img = result_photometry["image"]
+            if not result_photometry["success"]:
+                raise RuntimeError(result_photometry["error"])
             target_catalog = result_photometry["catalog"]
-            target_bkg = result_photometry["target_bkg"]
-            target_bkgrms = result_photometry["target_bkgrms"]
-            target_mask = result_photometry["target_mask"]
-            if not result_photometry["success"]:
-                raise RuntimeError(result_photometry["error"])
         
-        if config.do_photometric_calibration:
-            photometric_calibration_args = [target_img, target_catalog, False, config.photcal]
+        # Photometric Calibration
+        if config.single_process['do_photometric_calibration']:
+            photometric_calibration_args = [target_img, target_catalog, ra, dec, False, config.photcal]
             result_photometric_calibration = photometric_calibration_worker(photometric_calibration_args)
-            target_img = result_photometric_calibration["image"]
-            target_refcatalog = result_photometric_calibration["refcatalog"]
-            target_catalog = result_photometric_calibration["target_catalog"]
             if not result_photometric_calibration["success"]:
                 raise RuntimeError(result_photometric_calibration["error"])
-            
-        if clear:
-            target_img.clear(verbose=False)
-            if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-            if target_srcmask is not None: target_srcmask.clear(verbose=False)
-            if target_bkg is not None: target_bkg.clear(verbose=False)
-            if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
-            if target_catalog is not None: target_catalog.clear(verbose=False)
-            if target_refcatalog is not None: target_refcatalog.clear(verbose=False)
-            if target_mask is not None: target_mask.clear(verbose=False)
-        return {"success": True, "image": target_img, "sourcemask": target_srcmask, "bkgmap": target_bkg, "bkgrms": target_bkgrms, "catalog": target_catalog, "refcatalog": target_refcatalog, "error": None, "function": "pipeline_worker_before_stacking"}
+            target_catalog_ref = result_photometric_calibration["catalog_ref"]
 
-    except Exception as e:
-        print(e)
-        target_img.clear(verbose=False)
-        if target_invalidmask is not None: target_invalidmask.clear(verbose=False)
-        if target_srcmask is not None: target_srcmask.clear(verbose=False)
-        if target_bkg is not None: target_bkg.clear(verbose=False)
-        if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
-        if target_catalog is not None: target_catalog.clear(verbose=False)
-        if target_refcatalog is not None: target_refcatalog.clear(verbose=False)
-        if target_mask is not None: target_mask.clear(verbose=False)
-        return {"success": False, "image": target_img, "sourcemask": target_srcmask, "bkgmap": target_bkg, "bkgrms": target_bkgrms, "catalog": target_catalog, "refcatalog": target_refcatalog, "error": f"pipeline_worker_before_stacking: {e}", "function": "pipeline_worker_before_stacking"}
+        # Forced photometry
+        if config.single_process['do_forced_photometry']:
+            if target_catalog_ref is not None:
+                # Forced photometry for reference catalog + target ra/dec
+                ra_arr = np.append(np.array(target_catalog_ref.target_data['X_WORLD']), ra)
+                dec_arr = np.append(np.array(target_catalog_ref.target_data['Y_WORLD']), dec)
+                forced_photometry_args = [target_img, target_bkg, target_bkgrms, ra_arr, dec_arr, 'coord', False, config.forced_photometry]
+                result_forced_photometry = forced_photometry_worker(forced_photometry_args)
+                if not result_forced_photometry["success"]:
+                    raise RuntimeError(result_forced_photometry["error"])
+                target_catalog_forced = result_forced_photometry["catalog_forced"]
 
-def stacking_worker(args):
-    target_imgset, clear, stack_prepare_config, stack_config = args
-    stacked_img = None
-    stacked_bkgrms = None
-    try:
-        target_imgset.prepare_stack(**stack_prepare_config)
-        stacked_img, stacked_bkgrms = target_imgset.stack(**stack_config)
-        if clear:
-            for target_img in target_imgset.target_images:
-                target_img.clear(verbose=False)
-            for target_bkgrms in target_imgset.bkgrms:
-                target_bkgrms.clear(verbose=False)
-            if stacked_img is not None: stacked_img.clear(verbose=False)
-            if stacked_bkgrms is not None: stacked_bkgrms.clear(verbose=False)
-        return {"success": True, "image": stacked_img, "bkgrms": stacked_bkgrms, "error": None, "function": "stacking"}
-    except Exception as e:
-        return {"success": False, "image": None, "error": f"stacking: {e}", "function": "pipeline_stacking_worker"}
-    
-def DIA_worker(args):
-    target_img, reference_img, clear, DIA_kwargs = args
-    subtracted_img = None
-    reference_img = None
-    subtracted_catalog = None
-    candidate_catalog = None
-    transient_catalog = None
-    try:
-        (all_catalogs, 
-        candidate_catalogs, 
-        transient_catalogs, 
-        subframe_target_imglist, 
-        subframe_reference_imglist, 
-        subframe_subtract_imglist) = target_img.DIA(
-            reference_img = reference_img, 
-            target_bkg = None, 
-            **DIA_kwargs)
-        subtracted_catalog = all_catalogs[0]
-        candidate_catalog = candidate_catalogs[0]
-        transient_catalog = transient_catalogs[0]
-        target_img = subframe_target_imglist[0]
-        reference_img = subframe_reference_imglist[0]
-        subtracted_img = subframe_subtract_imglist[0]
+                # Photometric calibration for reference catalog
+                photcal_forced_kwargs = config.photcal.copy()
+                photcal_forced_kwargs['magnitude_key'] = 'MAG_APER_2'
+                photcal_forced_kwargs['magnitudeerr_key'] = 'MAGERR_APER_2'
+                photometric_calibration_args = [target_img, target_catalog_forced, ra, dec, False, photcal_forced_kwargs]
+                result_photometric_calibration = photometric_calibration_worker(photometric_calibration_args)
+                if not result_photometric_calibration["success"]:
+                    raise RuntimeError(result_photometric_calibration["error"])
+            else:
+                forced_photometry_args = [target_img, target_bkg, target_bkgrms, ra, dec, 'coord', False, config.forced_photometry]
+                result_forced_photometry = forced_photometry_worker(forced_photometry_args)
+                if not result_forced_photometry["success"]:
+                    raise RuntimeError(result_forced_photometry["error"])
+                target_catalog_forced = result_forced_photometry["catalog_forced"]
+                target_catalog_forced = target_img.apply_zp(target_catalog_forced, verbose = False, save = True)
         
-        if clear:
-            target_img.clear(verbose=False)
-            if reference_img is not None: reference_img.clear(verbose=False)
-            if subtracted_img is not None: subtracted_img.clear(verbose=False)
-            if subtracted_catalog is not None: subtracted_catalog.clear(verbose=False)
-            if candidate_catalog is not None: candidate_catalog.clear(verbose=False)
-            if transient_catalog is not None: transient_catalog.clear(verbose=False)
-        return {"success": True, "image": target_img, "reference_img": reference_img, "subtracted_img": subtracted_img, "subtracted_catalog": subtracted_catalog, "candidate_catalog": candidate_catalog, "transient_catalog": transient_catalog, "error": None, "function": "DIA"}
-    except Exception as e:
-        target_img.clear(verbose=False)
-        if reference_img is not None: reference_img.clear(verbose=False)
-        if subtracted_img is not None: subtracted_img.clear(verbose=False)
-        if subtracted_catalog is not None: subtracted_catalog.clear(verbose=False)
-        if candidate_catalog is not None: candidate_catalog.clear(verbose=False)
-        if transient_catalog is not None: transient_catalog.clear(verbose=False)
-        return {"success": False, "image": target_img, "reference_img": reference_img, "subtracted_img": subtracted_img, "subtracted_catalog": subtracted_catalog, "candidate_catalog": candidate_catalog, "transient_catalog": transient_catalog, "error": f"DIA: {e}", "function": "DIA"}
-
-def pipeline_worker_after_stacking(args):
-    stacked_img, stacked_bkgrms, reference_img, ra, dec, clear, config = args
-
-    stacked_ivpmask = None
-    stacked_srcmask = None
-    stacked_bkg = None
-    stacked_catalog = None
-    stacked_refcatalog = None
-    stacked_forcatalog = None
-    subtracted_img = None
-    subtracted_catalog = None
-    candidate_catalog = None
-    transient_catalog = None
-    subtracted_forced_catalog = None
-    try:
-        if config.do_calculate_invalidmask:
-            invalidmask_args = [stacked_img, False, config.invalidmask]
-            result_invalidmask = calculate_invalidmask_worker(invalidmask_args)
-            stacked_img = result_invalidmask["image"]
-            stacked_ivpmask = result_invalidmask["invalidmask"]
-            if not result_invalidmask["success"]:
-                raise RuntimeError(result_invalidmask["error"])
-
-        if config.do_calculate_sourcemask:
-            sourcemask_args = [stacked_img, None, ra, dec, config.circularmask['radius_arcsec'], False, config.sourcemask]
-            result_sourcemask = calculate_srcmask_worker(sourcemask_args)
-            stacked_img = result_sourcemask["image"]
-            stacked_srcmask = result_sourcemask["sourcemask"]
-            if not result_sourcemask["success"]:
-                raise RuntimeError(result_sourcemask["error"])
-
-        if config.do_calculate_bkgmap:
-            bkgmap_args = [stacked_img, stacked_srcmask, stacked_ivpmask, False, config.bkgmap]
-            result_bkgmap = calculate_bkgmap_worker(bkgmap_args)
-            stacked_img = result_bkgmap["image"]
-            stacked_bkg = result_bkgmap["bkgmap"]
-            if not result_bkgmap["success"]:
-                raise RuntimeError(result_bkgmap["error"])
-
-        if config.do_photometry:
-            # Background is set to MANUAL to avoid double background subtraction from the image.
-            sex_params = dict(BACK_TYPE = 'MANUAL')
-            photometry_args = [stacked_img, stacked_bkg, stacked_bkgrms, None, sex_params, False, config.photometry]
-            result_photometry = photometry_worker(photometry_args)
-            stacked_img = result_photometry["image"]
-            stacked_catalog = result_photometry["catalog"]
-            stacked_bkgrms = result_photometry["target_bkgrms"]
-            if not result_photometry["success"]:
-                raise RuntimeError(result_photometry["error"])
-        
-        if config.do_photometric_calibration:
-            photometric_calibration_args = [stacked_img, stacked_catalog, False, config.photcal]
-            result_photometric_calibration = photometric_calibration_worker(photometric_calibration_args)
-            stacked_img = result_photometric_calibration["image"]
-            stacked_refcatalog = result_photometric_calibration["refcatalog"]
-            stacked_catalog = result_photometric_calibration["target_catalog"]
-            if not result_photometric_calibration["success"]:
-                raise RuntimeError(result_photometric_calibration["error"])
-            
-        if config.do_forced_photometry:
-            forced_photometry_args = [stacked_img, stacked_bkg, stacked_bkgrms, ra, dec, 'coord', False, config.forced_photometry]
-            result_forced_photometry = forced_photometry_worker(forced_photometry_args)
-            stacked_img = result_forced_photometry["image"]
-            stacked_forcatalog = result_forced_photometry["catalog"]
-            if not result_forced_photometry["success"]:
-                raise RuntimeError(result_forced_photometry["error"])
-            
-        if config.do_DIA:
+        # Differential Image Analysis
+        if config.single_process['do_DIA']:
             if reference_img is None:
                 raise ValueError("Reference image is not found.")
-            DIA_args = [stacked_img, reference_img, clear, config.DIA]
+            DIA_args = [target_img, reference_img, False, config.DIA]
             result_DIA = DIA_worker(DIA_args)
-            stacked_img = result_DIA["image"]
-            reference_img = result_DIA["reference_img"]
+            if not result_DIA["success"]:
+                raise RuntimeError(result_DIA["error"])
+            science_img = result_DIA["science_img"]
+            reference_sub_img = result_DIA["reference_img"]
             subtracted_img = result_DIA["subtracted_img"]
             subtracted_catalog = result_DIA["subtracted_catalog"]
             candidate_catalog = result_DIA["candidate_catalog"]
             transient_catalog = result_DIA["transient_catalog"]
-            if not result_DIA["success"]:
-                raise RuntimeError(result_DIA["error"])
             
-            if config.do_forced_photometry:
+            if config.single_process['do_forced_photometry']:
                 forced_photometry_args = [subtracted_img, None, None, ra, dec, 'coord', False, config.forced_photometry]
                 result_forced_photometry = forced_photometry_worker(forced_photometry_args)
                 subtracted_img = result_forced_photometry["image"]
-                subtracted_forced_catalog = result_forced_photometry["catalog"]
+                subtracted_catalog_forced = result_forced_photometry["catalog_forced"]
                 if not result_forced_photometry["success"]:
                     raise RuntimeError(result_forced_photometry["error"])
-            
+                subtracted_catalog_forced = target_img.apply_zp(subtracted_catalog_forced, verbose = False, save = True)
+     
+    except Exception as e:
+        error = str(e)
+    
+    finally:
         if clear:
-            stacked_img.clear(verbose=False)
-            if stacked_bkgrms is not None: stacked_bkgrms.clear(verbose=False)
-            if stacked_catalog is not None: stacked_catalog.clear(verbose=False)
-            if stacked_refcatalog is not None: stacked_refcatalog.clear(verbose=False)
-            if stacked_forcatalog is not None: stacked_forcatalog.clear(verbose=False)
+            if target_img is not None: target_img.clear(verbose=False)
             if reference_img is not None: reference_img.clear(verbose=False)
+            if target_ivpmask is not None: target_ivpmask.clear(verbose=False)
+            if target_srcmask is not None: target_srcmask.clear(verbose=False)
+            if target_bkg is not None: target_bkg.clear(verbose=False)
+            if target_bkgrms is not None: target_bkgrms.clear(verbose=False)
+            if target_catalog is not None: target_catalog.clear(verbose=False)
+            if target_catalog_ref is not None: target_catalog_ref.clear(verbose=False)
+            if target_catalog_forced is not None: target_catalog_forced.clear(verbose=False)
+            if science_img is not None: science_img.clear(verbose=False)
+            if reference_sub_img is not None: reference_sub_img.clear(verbose=False)
             if subtracted_img is not None: subtracted_img.clear(verbose=False)
             if subtracted_catalog is not None: subtracted_catalog.clear(verbose=False)
             if candidate_catalog is not None: candidate_catalog.clear(verbose=False)
             if transient_catalog is not None: transient_catalog.clear(verbose=False)
-            if subtracted_forced_catalog is not None: subtracted_forced_catalog.clear(verbose=False)
-            
-        return {"success": True, "image": stacked_img, "bkgrms": stacked_bkgrms, "catalog": stacked_catalog, "refcatalog": stacked_refcatalog, "forcatalog": stacked_forcatalog, "error": None, "function": "pipeline_after_stacking_worker"}
+            if subtracted_catalog_forced is not None: subtracted_catalog_forced.clear(verbose=False)
+        
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = target_img
+        result_dict['sourcemask'] = target_srcmask
+        result_dict['bkgmap'] = target_bkg
+        result_dict['bkgrms'] = target_bkgrms
+        result_dict['catalog'] = target_catalog
+        result_dict['catalog_ref'] = target_catalog_ref
+        result_dict['catalog_forced'] = target_catalog_forced
+        result_dict['science_img'] = science_img
+        result_dict['reference_img'] = reference_sub_img
+        result_dict['subtracted_img'] = subtracted_img
+        result_dict['subtracted_catalog'] = subtracted_catalog
+        result_dict['candidate_catalog'] = candidate_catalog
+        result_dict['transient_catalog'] = transient_catalog
+        result_dict['subtracted_catalog_forced'] = subtracted_catalog_forced
+        result_dict['error'] = error
+        result_dict['function'] = "pipeline_worker_before_stacking"
+        
+        return result_dict
+
+def stacking_worker(args):
+    target_imgset, clear, stack_select_config, stack_prepare_config, stack_config = args
+
+    stacked_img = None
+    stacked_bkgrms = None
+    error = None
+
+    try:
+        if len(target_imgset.target_images) > 5:
+            target_imgset.select_quality_images(**stack_select_config)
+        # If the number of images is less than 3, use all images for stacking
+        if len(target_imgset.target_images) < 3:
+            target_imgset.target_img_ids = target_imgset.image_ids
+        target_imgset.prepare_stack(**stack_prepare_config)
+        stacked_img, stacked_bkgrms = target_imgset.stack(**stack_config)
+
     except Exception as e:
-        stacked_img.clear(verbose=False)
-        if stacked_bkgrms is not None: stacked_bkgrms.clear(verbose=False)
-        if stacked_catalog is not None: stacked_catalog.clear(verbose=False)
-        if stacked_refcatalog is not None: stacked_refcatalog.clear(verbose=False)
-        if stacked_forcatalog is not None: stacked_forcatalog.clear(verbose=False)
-        if reference_img is not None: reference_img.clear(verbose=False)
-        if subtracted_img is not None: subtracted_img.clear(verbose=False)
-        if subtracted_catalog is not None: subtracted_catalog.clear(verbose=False)
-        if candidate_catalog is not None: candidate_catalog.clear(verbose=False)
-        if transient_catalog is not None: transient_catalog.clear(verbose=False)
-        if subtracted_forced_catalog is not None: subtracted_forced_catalog.clear(verbose=False)
-        return {"success": False, "image": stacked_img, "bkgrms": stacked_bkgrms, "catalog": stacked_catalog, "refcatalog": stacked_refcatalog, "forcatalog": stacked_forcatalog, "error": f"pipeline_after_stacking: {e}", "function": "pipeline_after_stacking_worker"}
+        error = f"stacking: {e}"
+
+    finally:
+        if clear:
+            for target_img in getattr(target_imgset, "target_images", []):
+                if target_img is not None:
+                    target_img.clear(verbose=False)
+
+            for target_bkgrms in getattr(target_imgset, "bkgrms", []):
+                if target_bkgrms is not None:
+                    target_bkgrms.clear(verbose=False)
+
+            if stacked_img is not None:
+                stacked_img.clear(verbose=False)
+
+            if stacked_bkgrms is not None:
+                stacked_bkgrms.clear(verbose=False)
+        
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = stacked_img
+        result_dict['bkgrms'] = stacked_bkgrms
+        result_dict['error'] = error
+        result_dict['function'] = "stacking"
+        return result_dict
+
+def DIA_worker(args):
+    target_img, reference_img, clear, DIA_kwargs = args
+
+    science_img = None
+    reference_sub_img = None
+    subtracted_img = None
+    subtracted_catalog = None
+    candidate_catalog = None
+    transient_catalog = None
+    error = None
+
+    try:
+        (
+            all_catalogs,
+            candidate_catalogs,
+            transient_catalogs,
+            subframe_target_imglist,
+            subframe_reference_imglist,
+            subframe_subtract_imglist,
+        ) = target_img.DIA(
+            reference_img=reference_img,
+            target_bkg=None,
+            **DIA_kwargs,
+        )
+
+        subtracted_catalog = all_catalogs[0]
+        candidate_catalog = candidate_catalogs[0]
+        transient_catalog = transient_catalogs[0]
+        science_img = subframe_target_imglist[0]
+        reference_sub_img = subframe_reference_imglist[0]
+        subtracted_img = subframe_subtract_imglist[0]
+
+    except Exception as e:
+        error = f"DIA: {e}"
+
+    finally:
+        if clear:
+            for obj in [
+                science_img,
+                reference_sub_img,
+                subtracted_img,
+                subtracted_catalog,
+                candidate_catalog,
+                transient_catalog,
+            ]:
+                if obj is not None:
+                    obj.clear(verbose=False)
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['science_img'] = science_img
+        result_dict['reference_img'] = reference_sub_img
+        result_dict['subtracted_img'] = subtracted_img
+        result_dict['subtracted_catalog'] = subtracted_catalog
+        result_dict['candidate_catalog'] = candidate_catalog
+        result_dict['transient_catalog'] = transient_catalog
+        result_dict['error'] = error
+        result_dict['function'] = "DIA"
+    return result_dict
+
+def pipeline_worker_after_stacking(args):
+    stacked_img, reference_img, ra, dec, clear, config = args
+    error = None
+
+    # Image variables
+    stacked_ivpmask = None
+    stacked_srcmask = None
+    stacked_bkg = None
+    stacked_bkgrms = None
+    
+    # Photometry variables
+    stacked_catalog = None
+    stacked_catalog_ref = None
+    stacked_catalog_forced = None
+    
+    # DIA variables
+    science_img = None
+    reference_sub_img = None
+    subtracted_img = None
+    subtracted_catalog = None
+    candidate_catalog = None
+    transient_catalog = None
+    subtracted_catalog_forced = None
+    try:
+        # Platesolve
+        if config.stacked_process['do_platesolve']:
+            platesolve_args = [stacked_img, False]
+            result_platesolve = platesolve_worker(platesolve_args)
+            if not result_platesolve["success"]:
+                raise RuntimeError(result_platesolve["error"])
+            stacked_img = result_platesolve["image"]
+            
+        # Calculate invalidmask
+        if config.stacked_process['use_invalidmask']:
+            if config.stacked_process['do_update_invalidmask']:
+                invalidmask_args = [stacked_img, False, config.invalidmask]
+                result_invalidmask = calculate_invalidmask_worker(invalidmask_args)
+                if not result_invalidmask["success"]:
+                    raise RuntimeError(result_invalidmask["error"])
+                stacked_ivpmask = result_invalidmask["invalidmask"]
+            else:
+                stacked_ivpmask = stacked_img.invalidmask
+            
+        # Calculate sourcemask
+        if config.stacked_process['use_sourcemask']:
+            if config.stacked_process['do_update_sourcemask']:
+                sourcemask_args = [stacked_img, None, ra, dec, config.circularmask['radius_arcsec'], False, config.sourcemask]
+                result_sourcemask = calculate_srcmask_worker(sourcemask_args)
+                if not result_sourcemask["success"]:
+                    raise RuntimeError(result_sourcemask["error"])
+                stacked_srcmask = result_sourcemask["sourcemask"]
+            else:
+                stacked_srcmask = stacked_img.sourcemask
+        
+        # Calculate bkgmap
+        if config.stacked_process['use_bkgmap']:
+            if config.stacked_process['do_update_bkgmap']:
+                bkgmap_args = [stacked_img, stacked_srcmask, stacked_ivpmask, False, config.bkgmap]
+                result_bkgmap = calculate_bkgmap_worker(bkgmap_args)
+                if not result_bkgmap["success"]:
+                    raise RuntimeError(result_bkgmap["error"])
+                stacked_bkg = result_bkgmap["bkgmap"]
+            else:
+                stacked_bkg = stacked_img.bkgmap
+        
+        # Calculate bkgrms
+        if config.stacked_process['use_bkgrms']:    
+            if config.stacked_process['do_update_bkgrms']:
+                bkgrms_args = [stacked_img, stacked_srcmask, stacked_ivpmask, False, config.bkgrms]
+                result_bkgrms = calculate_bkgrms_worker(bkgrms_args)
+                if not result_bkgrms["success"]:
+                    raise RuntimeError(result_bkgrms["error"])
+                stacked_bkgrms = result_bkgrms["bkgrms"]
+            else:
+                stacked_bkgrms = stacked_img.bkgrms
+                
+        # Photometry
+        if config.stacked_process['do_photometry']:
+            # Background is set to MANUAL to avoid double background subtraction from the image.
+            sex_params = dict()
+            photometry_args = [stacked_img, stacked_bkg, stacked_bkgrms, None, sex_params, False, config.photometry]
+            result_photometry = photometry_worker(photometry_args)
+            if not result_photometry["success"]:
+                raise RuntimeError(result_photometry["error"])
+            stacked_catalog = result_photometry["catalog"]
+        else:
+            stacked_catalog = stacked_img.catalog
+        
+        # Photometric calibration
+        if config.stacked_process['do_photometric_calibration']:
+            photometric_calibration_args = [stacked_img, stacked_catalog, ra, dec, False, config.photcal]
+            result_photometric_calibration = photometric_calibration_worker(photometric_calibration_args)
+            if not result_photometric_calibration["success"]:
+                raise RuntimeError(result_photometric_calibration["error"])
+            stacked_catalog_ref = result_photometric_calibration["catalog_ref"]
+            
+        # Forced photometry
+        if config.stacked_process['do_forced_photometry']:
+            if stacked_catalog_ref is not None:
+                # Forced photometry for reference catalog + target ra/dec
+                ra_arr = np.append(np.array(stacked_catalog_ref.target_data['X_WORLD']), ra)
+                dec_arr = np.append(np.array(stacked_catalog_ref.target_data['Y_WORLD']), dec)
+                forced_photometry_args = [stacked_img, stacked_bkg, stacked_bkgrms, ra_arr, dec_arr, 'coord', False, config.forced_photometry]
+                result_forced_photometry = forced_photometry_worker(forced_photometry_args)
+                stacked_catalog_forced = result_forced_photometry["catalog_forced"]
+                if not result_forced_photometry["success"]:
+                    raise RuntimeError(result_forced_photometry["error"])
+
+                # Photometric calibration for reference catalog
+                photcal_forced_kwargs = config.photcal.copy()
+                photcal_forced_kwargs['magnitude_key'] = 'MAG_APER_2'
+                photcal_forced_kwargs['magnitudeerr_key'] = 'MAGERR_APER_2'
+                photometric_calibration_args = [stacked_img, stacked_catalog_forced, ra, dec, False, photcal_forced_kwargs]
+                result_photometric_calibration = photometric_calibration_worker(photometric_calibration_args)
+                if not result_photometric_calibration["success"]:
+                    raise RuntimeError(result_photometric_calibration["error"])
+            else:
+                forced_photometry_args = [stacked_img, stacked_bkg, stacked_bkgrms, ra, dec, 'coord', False, config.forced_photometry]
+                result_forced_photometry = forced_photometry_worker(forced_photometry_args)
+                if not result_forced_photometry["success"]:
+                    raise RuntimeError(result_forced_photometry["error"])
+                stacked_catalog_forced = result_forced_photometry["catalog_forced"]
+                stacked_catalog_forced = stacked_img.apply_zp(stacked_catalog_forced, verbose = False, save = True)
+
+        if config.stacked_process['do_DIA']:
+            if reference_img is None:
+                raise ValueError("Reference image is not found.")
+            DIA_args = [stacked_img, reference_img, False, config.DIA]
+            result_DIA = DIA_worker(DIA_args)
+            if not result_DIA["success"]:
+                raise RuntimeError(result_DIA["error"])
+            science_img = result_DIA["science_img"]
+            reference_sub_img = result_DIA["reference_img"]
+            subtracted_img = result_DIA["subtracted_img"]
+            subtracted_catalog = result_DIA["subtracted_catalog"]
+            candidate_catalog = result_DIA["candidate_catalog"]
+            transient_catalog = result_DIA["transient_catalog"]
+            
+            if config.stacked_process['do_forced_photometry']:
+                forced_photometry_args = [subtracted_img, None, None, ra, dec, 'coord', False, config.forced_photometry]
+                result_forced_photometry = forced_photometry_worker(forced_photometry_args)
+                subtracted_catalog_forced = result_forced_photometry["catalog_forced"]
+                if not result_forced_photometry["success"]:
+                    raise RuntimeError(result_forced_photometry["error"])
+                subtracted_catalog_forced = subtracted_img.apply_zp(subtracted_catalog_forced, verbose = False, save = True)
+
+    except Exception as e:
+        error = f"pipeline_after_stacking: {e}"
+
+    finally:
+        if clear:
+            if stacked_img is not None: stacked_img.clear(verbose=False)
+            if reference_img is not None: reference_img.clear(verbose=False)
+            if stacked_ivpmask is not None: stacked_ivpmask.clear(verbose=False)
+            if stacked_srcmask is not None: stacked_srcmask.clear(verbose=False)
+            if stacked_bkg is not None: stacked_bkg.clear(verbose=False)
+            if stacked_bkgrms is not None: stacked_bkgrms.clear(verbose=False)
+            if stacked_catalog is not None: stacked_catalog.clear(verbose=False)
+            if stacked_catalog_ref is not None: stacked_catalog_ref.clear(verbose=False)
+            if stacked_catalog_forced is not None: stacked_catalog_forced.clear(verbose=False)
+            if science_img is not None: science_img.clear(verbose=False)
+            if reference_sub_img is not None: reference_sub_img.clear(verbose=False)
+            if subtracted_img is not None: subtracted_img.clear(verbose=False)
+            if subtracted_catalog is not None: subtracted_catalog.clear(verbose=False)
+            if candidate_catalog is not None: candidate_catalog.clear(verbose=False)
+            if transient_catalog is not None: transient_catalog.clear(verbose=False)
+            if subtracted_catalog_forced is not None: subtracted_catalog_forced.clear(verbose=False)
+
+        result_dict = dict()
+        result_dict['success'] = error is None
+        result_dict['image'] = stacked_img
+        result_dict['sourcemask'] = stacked_srcmask
+        result_dict['bkgmap'] = stacked_bkg
+        result_dict['bkgrms'] = stacked_bkgrms
+        result_dict['catalog'] = stacked_catalog
+        result_dict['catalog_ref'] = stacked_catalog_ref
+        result_dict['catalog_forced'] = stacked_catalog_forced
+        result_dict['science_img'] = science_img
+        result_dict['reference_img'] = reference_img
+        result_dict['subtracted_img'] = subtracted_img
+        result_dict['subtracted_catalog'] = subtracted_catalog
+        result_dict['candidate_catalog'] = candidate_catalog
+        result_dict['transient_catalog'] = transient_catalog
+        result_dict['subtracted_catalog_forced'] = subtracted_catalog_forced
+        result_dict['error'] = error
+        result_dict['function'] = "pipeline_after_stacking"
+        return result_dict
 
 #%%
 
@@ -776,20 +1046,29 @@ class AlertProcessor:
         # Try query with objname first
         self.gwportal_connector.query_type = query_type
         tbl_observation_objname = self.gwportal_connector.query(**kwargs)
-        tbl_observation = tbl_observation_objname
-        if ('tile' in tbl_observation_objname.colnames) & ('target' in tbl_observation_objname.colnames):
-            tbl_observation_objname.remove_columns(['tile', 'target'])
+        # tbl_observation = tbl_observation_objname
+        if 'filepath' in tbl_observation_objname.colnames:
+            list_filepath = list[Any](tbl_observation_objname["filepath"])
+        else:
+            list_filepath = []
+
+        # if ('tile' in tbl_observation_objname.colnames) & ('target' in tbl_observation_objname.colnames):
+        #     tbl_observation_objname.remove_columns(['tile', 'target'])
         # Try query with tile_id second
         if alert_instance.tile_id is not None:
             kwargs.pop('object_name', None)
             kwargs['tile_name'] = alert_instance.tile_id
             tbl_observation_tile = self.gwportal_connector.query(**kwargs)
-            tbl_observation = vstack([tbl_observation, tbl_observation_tile])
+            # tbl_observation = vstack([tbl_observation, tbl_observation_tile])
+            if 'filepath' in tbl_observation_tile.colnames:
+                list_filepath.extend(list[Any](tbl_observation_tile["filepath"]))
             
-        if len(tbl_observation) == 0:
+        if len(list_filepath) == 0:
             print('WARNING: No images are found.')
             return False
-        list_filepath = tbl_observation['filepath']
+        
+        list_filepath = list(dict.fromkeys(list_filepath))
+
         self.target_images = self._load_images(list_filepath)
         self.all_images = self.target_images
         
@@ -841,6 +1120,7 @@ class AlertProcessor:
         # IO bounded operation
         with ThreadPoolExecutor(max_workers = 64) as pool:
             target_images = list(tqdm(pool.map(load_image, list_filepath), desc = 'Loading images...', total = len(list_filepath)))
+            target_images = [img for img in target_images if img is not None]
         return target_images
     
     def _check_input_images(self):
@@ -1034,7 +1314,7 @@ class AlertProcessor:
     def calculate_bkgrms(self, alert_instance: Alert):
         self._check_input_images()
 
-        bkgrms_kwargs = self.config.bkgrms
+        bkgrms_kwargs = self.config.bkgrms.copy()
 
         if self.config.calculate_bkgrms_from_propagation:
             bkgrms_kwargs.pop('filter_size', None)
@@ -1067,7 +1347,7 @@ class AlertProcessor:
     def photometric_calibration(self, alert_instance: Alert):
         self._check_input_images()
 
-        tasks = [(img, img.catalog, True, self.config.photcal)
+        tasks = [(img, img.catalog, alert_instance.ra, alert_instance.dec, True, self.config.photcal)
                 for img in self.target_images]
 
         return self.run_parallel(tasks, photometric_calibration_worker,
@@ -1077,9 +1357,19 @@ class AlertProcessor:
     
     def pipeline_before_stacking(self, alert_instance: Alert):
         self._check_input_images()
-        
-        tasks = [(img, alert_instance.ra, alert_instance.dec, True, self.config) for img in self.target_images]
-        
+
+        if self.config.single_process['do_DIA']:
+            reference_imgdict = {}
+            for single_img in tqdm(self.target_images, desc = 'Querying reference images...'):
+                reference_result = single_img.get_referenceframe(verbose = False)
+                reference_img = None
+                if reference_result is not None:
+                    reference_img = reference_result[0]
+                reference_imgdict[single_img] = reference_img
+            tasks = [(single_img, reference_imgdict[single_img], alert_instance.ra, alert_instance.dec, True, self.config) for single_img in self.target_images]
+        else:
+            tasks = [(single_img, None, alert_instance.ra, alert_instance.dec, True, self.config) for single_img in self.target_images]
+
         return self.run_parallel(tasks, pipeline_worker_before_stacking,
                                 step_name='pipeline_before_stacking',
                                 desc='Pipeline before stacking...',
@@ -1106,19 +1396,22 @@ class AlertProcessor:
             obsdate_key = obsdate_key
         )
         original_max_workers = self.config.max_workers
-        self.config.max_workers = int(np.ceil(self.config.max_workers/2))
-        tasks = [(target_imgset, True, self.config.stack_prepare, self.config.stack) for target_imgset in target_imgsetlist]
-        print('Total number of stacking tasks: ', len(tasks))
-        return self.run_parallel(tasks, stacking_worker,
-                                step_name='stacking',
-                                desc='Stacking...',
-                                batch_size = int(np.ceil(self.config.batch_size/3)))
+        try:
+            self.config.max_workers = int(np.ceil(self.config.max_workers/2))
+            tasks = [(target_imgset, True, self.config.stack_select, self.config.stack_prepare, self.config.stack) for target_imgset in target_imgsetlist]
+            print('Total number of stacking tasks: ', len(tasks))
+            return self.run_parallel(tasks, stacking_worker,
+                                    step_name='stacking',
+                                    desc='Stacking...',
+                                    batch_size = int(np.ceil(self.config.batch_size/3)))
+        finally:
+            self.config.max_workers = original_max_workers
     
     def pipeline_after_stacking(self, alert_instance: Alert):
         # sex photometry, photometric calibration, forced photometry, and DIA
         self._check_input_images()
 
-        if self.config.do_DIA:
+        if self.config.stacked_process['do_DIA']:
             reference_imgdict = {}
             for stacked_img in tqdm(self.target_images, desc = 'Querying reference images...'):
                 reference_result = stacked_img.get_referenceframe(verbose = False)
@@ -1126,29 +1419,37 @@ class AlertProcessor:
                 if reference_result is not None:
                     reference_img = reference_result[0]
                 reference_imgdict[stacked_img] = reference_img
-            tasks = [(stacked_img, stacked_img.bkgrms, reference_imgdict[stacked_img], alert_instance.ra, alert_instance.dec, True, self.config) for stacked_img in self.target_images]
+            tasks = [(stacked_img, reference_imgdict[stacked_img], alert_instance.ra, alert_instance.dec, True, self.config) for stacked_img in self.target_images]
         else:
-            tasks = [(stacked_img, stacked_img.bkgrms, None, alert_instance.ra, alert_instance.dec, True, self.config) for stacked_img in self.target_images]
+            tasks = [(stacked_img, None, alert_instance.ra, alert_instance.dec, True, self.config) for stacked_img in self.target_images]
         
         return self.run_parallel(tasks, pipeline_worker_after_stacking,
                                  step_name='pipeline_after_stacking',
                                  desc='Pipeline after stacking...',
                                  batch_size = self.config.batch_size)
         
-    def tractor_photometry(self, alert_instance: Alert):
+    def tractor_photometry(self, alert_instance: Alert,
+                           by_filter = False,
+                           by_exptime = False,
+                           by_objname = True,
+                           by_telname = False,
+                           by_observatory = False,
+                           by_obsdate = True,
+                           obsdate_delta = 0.5,
+                           obsdate_key = 'obsdate'):
         def is_valid(x):
             return x is not None and np.isfinite(x)
         self._check_input_images()
 
         target_imgsetlist = ImageSet(self.target_images).divide_images(
-            by_filter = False,
-            by_exptime = False,
-            by_objname = True,
-            by_telname = False,
-            by_observatory = False,
-            by_obsdate = True,
-            obsdate_delta = 0.5,
-            obsdate_key = 'obsdate'
+            by_filter = by_filter,  
+            by_exptime = by_exptime,
+            by_objname = by_objname,
+            by_telname = by_telname,
+            by_observatory = by_observatory,
+            by_obsdate = by_obsdate,
+            obsdate_delta = obsdate_delta,
+            obsdate_key = obsdate_key
         )
         
         target_ra = alert_instance.ra
@@ -1218,25 +1519,16 @@ class AlertProcessor:
 if __name__ == "__main__":
     db_connector = SQLConnector()
     db_data = db_connector.get_data(tbl_name = 'transient_status', select_key = '*')
-    row = db_data[db_data['objname'] == 'AT2025fep'][0]
+    row = db_data[db_data['objname'] == 'SN2025fvw'][0]
     alert_instance = Alert(**row)
+    objname = 'C26202'
+    ra = 53.136845833333325
+    dec = -27.863494444444445
+    alert_instance = Alert(objname = objname, ra = ra, dec = dec, trigger_time = Time('2001-01-01'), alert_time = Time('2001-01-01'))
     self = AlertProcessor()
-    # alert_instance = Alert(objname = 'UDS', trigger_time = '2022-01-01')# %%
 #%%
 if __name__ == "__main__":
-    # all_imagges = self.all_images
-    # target_images = self.target_images
-    # self.load_images_ezphot(alert_instance, file_pattern = '7DT*.fits')
-    # alert_instance = Alert(objname = 'T10058')
-    # alert_instance.trigger_time = Time('2001-01-01')
     self = AlertProcessor()
-    # self.load_images_db(alert_instance, 'raw', None, alert_instance.trigger_time)
-    self.load_images_ezphot(alert_instance, 'coadd_scaled*com.fits', obs_start_time = None)        
-    # self.pipeline_after_stacking(alert_instance)
-    # self.config.do_stack = False
-    # self.config.do_DIA = False
-
-    # self.all_images = all_imagess
-    # self.target_images = target_images
-    result_dict = self.tractor_photometry(alert_instance)
+    # self.load_images_db(alert_instance, 'raw', obs_start_time = '2025-05-17', obs_end_time = '2025-05-17')
+    self.load_images_ezphot(alert_instance, '7DT*.fits')
 # %%
