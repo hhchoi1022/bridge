@@ -44,7 +44,11 @@ class FINKConsumer:
 
         num_alert_limit = self.config._dict[self.survey_type]['num_alerts_limit']
         verbose = self.config._dict[self.survey_type]['verbose']
-        outdir = self.config._dict[self.survey_type]['outdir']
+        
+        outdir = Path(self.config._dict[self.survey_type]['outdir'])
+        outdir.mkdir(parents=True, exist_ok=True)
+        (outdir / 'processed').mkdir(parents=True, exist_ok=True)
+        (outdir / 'failed').mkdir(parents=True, exist_ok=True)
 
         command = ["fink_consumer", "-survey", self.survey_type]
 
@@ -57,7 +61,7 @@ class FINKConsumer:
         command.extend([
             "-start_at", "latest",
             "--save",
-            "-outdir", outdir
+            "-outdir", str(outdir)
         ])
 
         print("Starting FINKConsumer...")
@@ -110,29 +114,73 @@ class FINKConsumer:
         outdir = Path(self.config._dict[self.survey_type]['outdir'])
         processed_folder = outdir / 'processed'
         processed_folder.mkdir(exist_ok=True)
+        failed_folder = outdir / 'failed'
+        failed_folder.mkdir(exist_ok=True)
 
         print("Monitoring alert folder...")
 
         while self.is_monitoring:
 
             for file in outdir.glob('*.avro'):
+
+                processed_path = processed_folder / file.name
+                failed_path = failed_folder / file.name
+
+                if processed_path.exists():
+                    try:
+                        file.unlink()
+                    except Exception as e:
+                        print(f"Error deleting duplicated processed file {file.name}: {e}")
+                    continue
+
+                if failed_path.exists():
+                    try:
+                        file.unlink()
+                    except Exception as e:
+                        print(f"Error deleting duplicated failed file {file.name}: {e}")
+                    continue
+
                 try:
                     result = self.add_alert_to_db(file.name)
 
                     if result:
-                        file.rename(processed_folder / file.name)
+                        file.replace(processed_path)
+                        print(f"Moved {file.name} to processed/")
+                    else:
+                        file.replace(failed_path)
+                        print(f"Moved {file.name} to failed/")
 
                 except Exception as e:
                     print(f"Error processing {file.name}: {e}")
 
-            time.sleep(5)   # reduce latency
+                    try:
+                        file.replace(failed_path)
+                        print(f"Moved {file.name} to failed/")
+                    except Exception as move_error:
+                        print(f"Error moving {file.name} to failed/: {move_error}")
+
+            time.sleep(5)
             
     def read_alert(self, filename: str):
-        filepath = Path(self.config._dict[self.survey_type]['outdir']) / filename
-        if not filepath.exists():
-            filepath = Path(self.config._dict[self.survey_type]['outdir']) / 'processed' / filename
-            if not filepath.exists():
-                raise FileNotFoundError(f"File {filepath} not found.")
+        outdir = Path(self.config._dict[self.survey_type]['outdir'])
+
+        candidate_paths = [
+            outdir / filename,
+            outdir / 'processed' / filename,
+            outdir / 'failed' / filename,
+        ]
+
+        filepath = None
+        for path in candidate_paths:
+            if path.exists():
+                filepath = path
+                break
+
+        if filepath is None:
+            raise FileNotFoundError(
+                f"File {filename} not found in outdir, processed, or failed."
+            )
+
         r = AlertReader(str(filepath))
         return r.to_pandas()
     
@@ -176,9 +224,19 @@ class FINKConsumer:
     
     @property
     def alertlist(self):
+        outdir = Path(self.config._dict[self.survey_type]['outdir'])
+
         alert_dict = dict()
-        alert_dict['unprocessed'] = [file.name for file in list(Path(self.config._dict[self.survey_type]['outdir']).glob('*.avro'))]
-        alert_dict['processed'] = [file.name for file in list((Path(self.config._dict[self.survey_type]['outdir']) / 'processed').glob('*.avro'))]
+        alert_dict['unprocessed'] = [
+            file.name for file in outdir.glob('*.avro')
+        ]
+        alert_dict['processed'] = [
+            file.name for file in (outdir / 'processed').glob('*.avro')
+        ]
+        alert_dict['failed'] = [
+            file.name for file in (outdir / 'failed').glob('*.avro')
+        ]
+
         return alert_dict
         
     def _flatten_alert_dataframe(self, df):

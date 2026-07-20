@@ -1,7 +1,6 @@
 
 
 #%%
-
 from pathlib import Path
 from astropy.time import Time
 from astropy.table import Table

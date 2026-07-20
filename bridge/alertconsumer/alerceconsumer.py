@@ -6,8 +6,6 @@ This code manages the FINK consumer for the ToO trigger pipeline in BRIDGE.
 2. Manage connection to the FINK broker
 3. Store the alerts in a database
 '''
-
-
 #%%
 from pathlib import Path
 import threading
@@ -22,7 +20,7 @@ from bridge.utils.avro_writer import AvroWriter
 from bridge.configuration import Configuration
 from bridge.connector import SQLConnector
 from bridge.alertquerier import ALERCEQuerier
-
+#%%
 
 class ALERCEConsumer:
     def __init__(self, survey_type='ztf'):
@@ -62,6 +60,7 @@ class ALERCEConsumer:
         outdir = Path(self.config._dict[self.survey_type]['outdir'])
         outdir.mkdir(parents=True, exist_ok=True)
         (outdir / 'processed').mkdir(parents=True, exist_ok=True)
+        (outdir / 'failed').mkdir(parents=True, exist_ok=True)
 
         self._stop_event.clear()
         self.is_consuming = True
@@ -145,6 +144,8 @@ class ALERCEConsumer:
         outdir = Path(self.config._dict[self.survey_type]['outdir'])
         processed_folder = outdir / 'processed'
         processed_folder.mkdir(parents=True, exist_ok=True)
+        failed_folder = outdir / 'failed'
+        failed_folder.mkdir(parents=True, exist_ok=True)
 
         print("Monitoring alert folder...")
 
@@ -155,20 +156,32 @@ class ALERCEConsumer:
                         break
 
                     processed_path = processed_folder / file.name
+                    failed_path = failed_folder / file.name
 
-                    if processed_path.exists():
+                    if failed_path.exists():
                         try:
                             file.unlink()
                         except Exception as e:
-                            print(f"Error deleting duplicated file {file.name}: {e}")
+                            print(f"Error deleting duplicated failed file {file.name}: {e}")
                         continue
 
                     try:
                         result = self.add_alert_to_db(file.name)
+
                         if result:
-                            file.rename(processed_path)
+                            file.replace(processed_path)
+                            print(f"Moved {file.name} to processed/")
+                        else:
+                            file.replace(failed_path)
+                            print(f"Moved {file.name} to failed/")
+
                     except Exception as e:
                         print(f"Error processing {file.name}: {e}")
+                        try:
+                            file.replace(failed_path)
+                            print(f"Moved {file.name} to failed/")
+                        except Exception as move_error:
+                            print(f"Error moving {file.name} to failed/: {move_error}")
 
             except Exception as e:
                 print(f"Error in monitor loop: {e}")
@@ -257,11 +270,23 @@ class ALERCEConsumer:
         return num_alerts
             
     def read_alert(self, filename: str):
-        filepath = Path(self.config._dict[self.survey_type]['outdir']) / filename
-        if not filepath.exists():
-            filepath = Path(self.config._dict[self.survey_type]['outdir']) / 'processed' / filename
-            if not filepath.exists():
-                raise FileNotFoundError(f"File {filepath} not found.")
+        outdir = Path(self.config._dict[self.survey_type]['outdir'])
+
+        candidate_paths = [
+            outdir / filename,
+            outdir / 'processed' / filename,
+            outdir / 'failed' / filename,
+        ]
+
+        filepath = None
+        for path in candidate_paths:
+            if path.exists():
+                filepath = path
+                break
+
+        if filepath is None:
+            raise FileNotFoundError(f"File {filename} not found in outdir, processed, or failed.")
+
         r = AlertReader(str(filepath))
         return r.to_pandas()
     
@@ -292,18 +317,25 @@ class ALERCEConsumer:
             return False
     
     def is_alert_saved(self, filename: str):
-        filepath = Path(self.config._dict[self.survey_type]['outdir']) / filename
-        if not filepath.exists():
-            filepath = Path(self.config._dict[self.survey_type]['outdir']) / 'processed' / filename
-            if not filepath.exists():
-                return False
-        return True
+        outdir = Path(self.config._dict[self.survey_type]['outdir'])
+
+        candidate_paths = [
+            outdir / filename,
+            outdir / 'processed' / filename,
+            outdir / 'failed' / filename,
+        ]
+
+        return any(path.exists() for path in candidate_paths)
         
     @property
     def alertlist(self):
+        outdir = Path(self.config._dict[self.survey_type]['outdir'])
+
         alert_dict = dict()
-        alert_dict['unprocessed'] = [file.name for file in list(Path(self.config._dict[self.survey_type]['outdir']).glob('*.avro'))]
-        alert_dict['processed'] = [file.name for file in list((Path(self.config._dict[self.survey_type]['outdir']) / 'processed').glob('*.avro'))]
+        alert_dict['unprocessed'] = [file.name for file in outdir.glob('*.avro')]
+        alert_dict['processed'] = [file.name for file in (outdir / 'processed').glob('*.avro')]
+        alert_dict['failed'] = [file.name for file in (outdir / 'failed').glob('*.avro')]
+
         return alert_dict
         
     def _flatten_alert_dataframe(self, df):
@@ -383,4 +415,5 @@ class ALERCEConsumer:
 # %%
 if __name__ == '__main__':
     self = ALERCEConsumer('ztf')
-    self.run()
+    # self.run()
+# %%

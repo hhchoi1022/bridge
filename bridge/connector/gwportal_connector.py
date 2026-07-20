@@ -139,7 +139,7 @@ if __name__ == "__main__":
     self.query_type = 'processed'
 #%%
 if __name__ == "__main__":
-    since_days = 150
+    since_days = 5
     obs_start_date = None
     obs_end_date = None
     filter_name = None
@@ -157,3 +157,4 @@ if __name__ == "__main__":
     radius = None
     polygon = None
     tbl_processed = self.query(since_days = since_days, obs_start_date = obs_start_date, obs_end_date = obs_end_date, filter_name = filter_name, unit_name = unit_name, object_name = object_name, obsnote_contains = obsnote_contains, target_type = target_type, tile_name = tile_name, target_name_contains = target_name_contains, coord_sys = coord_sys, ra = ra, dec = dec, gl = gl, gb = gb, radius = radius, polygon = polygon)
+# %%

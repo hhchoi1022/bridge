@@ -11,7 +11,6 @@ from astropy.time import Time
 from astropy.table import Table
 import datetime
 import numpy as np
-from numpy.ma import is_masked
 from tqdm import tqdm
 from pathlib import Path
 from astropy.table import vstack
@@ -66,6 +65,7 @@ class AlertChecker:
             if not alert_instance.is_reference_ready:
                 alert_instance = self.prepare_reference_img(alert_instance)
             alert_instance = self.check_observation(alert_instance)
+            print(alert_instance.is_observed)
             if not alert_instance.is_observed:
                 continue
             # # pipeline
@@ -232,18 +232,11 @@ class AlertChecker:
         for imgset_filter in imgsetlist:
             target_images_to_stack = imgset_filter.select_quality_images(
                 seeing_key = 'SEEING',
-                depth_key = 'UL5SKY_APER_2',
+                depth_key = 'UL5SKY_APER_3',
                 ellipticity_key = 'ELLIP',
                 obsdate_key = 'DATE-OBS',
-                weight_ellipticity = 3.0,
-                weight_seeing = 2.0,
-                weight_depth = 1.0,
-                max_numbers = None,
-                seeing_limit = 6.0,
-                depth_limit = 15.0,
-                ellipticity_limit = 0.5,
-                visualize = True,
-                verbose = True,
+                visualize = False,
+                verbose = False,
             )
             target_images_to_stack_all.extend(target_images_to_stack)
         processor.target_images = target_images_to_stack_all
@@ -295,6 +288,8 @@ class AlertChecker:
         # Prepare images for stacking
         processor.pipeline_before_stacking(alert_instance)
         single_images = processor.target_images
+        if len(single_images) == 0:
+            return False
         # Stack images
         processor.stacking(by_filter = True,
                            by_exptime = False,
@@ -440,7 +435,7 @@ class AlertChecker:
         
         catalog_set = CatalogSet(catlist)
         if self.config.save_catalog:
-            save_catalog_dir = f'gppy_v1_{Time(alert_instance.update_time).datetime.strftime("%Y%m%d_%H%M%S")}'
+            save_catalog_dir = f'pipeline_{Time(alert_instance.update_time).datetime.strftime("%Y%m%d_%H%M%S")}'
             for catalog in tqdm(catalog_set.target_catalogs, desc = 'Saving catalogs...'):
                 catalog.savedir = Path(self.config.save_dir) / alert_instance.objname / save_catalog_dir
                 catalog.write(verbose = False)
@@ -608,7 +603,7 @@ class AlertChecker:
             alert_instance.lc_error = str(e)
             return False
 
-    def draw_photometricspectrum(self, alert_instance: Alert, catalog_set: CatalogSet, save_path : str = None, catalog_type: str = 'gppy_v1'):
+    def draw_photometricspectrum(self, alert_instance: Alert, catalog_set: CatalogSet, save_path : str = None, catalog_type: str = 'ezphot'):
         try:
             if not alert_instance.is_coordinate_given:
                 return False
@@ -788,7 +783,7 @@ class AlertChecker:
                 matching_radius_arcsec=self.config.matching_radius_arcsec,
             )
             
-            if photspec.data is None or len(photspec.data) == 0 or is_masked(photspec.data[flux_key]):
+            if photspec.data is None or len(photspec.data) == 0 or np.ma.getmaskarray(photspec.data[flux_key]).all():
                 print(f"No valid photometry data for {alert_instance.objname}")
                 continue
 
