@@ -696,11 +696,12 @@ def stacking_worker(args):
     error = None
 
     try:
-        if len(target_imgset.target_images) > 5:
-            target_imgset.select_quality_images(**stack_select_config)
-        # If the number of images is less than 3, use all images for stacking
-        if len(target_imgset.target_images) < 3:
-            target_imgset.target_img_ids = target_imgset.image_ids
+        if stack_select_config['enabled']:
+            if len(target_imgset.target_images) > 5:
+                target_imgset.select_quality_images(**stack_select_config)
+            # If the number of images is less than 3, use all images for stacking
+            if len(target_imgset.target_images) < 3:
+                target_imgset.target_img_ids = target_imgset.image_ids
         target_imgset.prepare_stack(**stack_prepare_config)
         stacked_img, stacked_bkgrms = target_imgset.stack(**stack_config)
 
@@ -1007,10 +1008,12 @@ class AlertProcessor:
             kwargs['obs_start'] = flexible_time_parser(obs_start_time)
         if obs_end_time is not None:
             kwargs['obs_end'] = flexible_time_parser(obs_end_time)
-            
-        self.ezphot_connector.objname = np.atleast_1d(alert_instance.objname)[0]
-        target_imgset_objname = self.ezphot_connector.search(pattern = file_pattern, return_type = 'science')
-        all_target_images = target_imgset_objname.target_images
+        
+        all_target_images = []
+        if alert_instance.objname is not None:
+            self.ezphot_connector.objname = np.atleast_1d(alert_instance.objname)[0]
+            target_imgset_objname = self.ezphot_connector.search(pattern = file_pattern, return_type = 'science')
+            all_target_images += target_imgset_objname.target_images
 
         # Try query with tile_id second
         if alert_instance.tile_id is not None:
@@ -1045,15 +1048,12 @@ class AlertProcessor:
             
         # Try query with objname first
         self.gwportal_connector.query_type = query_type
-        tbl_observation_objname = self.gwportal_connector.query(**kwargs)
-        # tbl_observation = tbl_observation_objname
-        if 'filepath' in tbl_observation_objname.colnames:
-            list_filepath = list[Any](tbl_observation_objname["filepath"])
-        else:
-            list_filepath = []
+        list_filepath = []
+        if kwargs['object_name'] is not None:
+            tbl_observation_objname = self.gwportal_connector.query(**kwargs)
+            if 'filepath' in tbl_observation_objname.colnames:
+                list_filepath.extend(list(tbl_observation_objname["filepath"]))
 
-        # if ('tile' in tbl_observation_objname.colnames) & ('target' in tbl_observation_objname.colnames):
-        #     tbl_observation_objname.remove_columns(['tile', 'target'])
         # Try query with tile_id second
         if alert_instance.tile_id is not None:
             kwargs.pop('object_name', None)
@@ -1061,7 +1061,7 @@ class AlertProcessor:
             tbl_observation_tile = self.gwportal_connector.query(**kwargs)
             # tbl_observation = vstack([tbl_observation, tbl_observation_tile])
             if 'filepath' in tbl_observation_tile.colnames:
-                list_filepath.extend(list[Any](tbl_observation_tile["filepath"]))
+                list_filepath.extend(list(tbl_observation_tile["filepath"]))
             
         if len(list_filepath) == 0:
             print('WARNING: No images are found.')

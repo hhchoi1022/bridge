@@ -139,7 +139,7 @@ if __name__ == "__main__":
     self.query_type = 'processed'
 #%%
 if __name__ == "__main__":
-    since_days = 5
+    since_days = 50
     obs_start_date = None
     obs_end_date = None
     filter_name = None
