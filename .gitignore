@@ -4,3 +4,7 @@
 # Large data files
 *.fits
 *.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
