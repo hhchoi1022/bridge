@@ -697,6 +697,7 @@ def stacking_worker(args):
 
     try:
         if stack_select_config['enabled']:
+            stack_select_config.pop('enabled', None)
             if len(target_imgset.target_images) > 5:
                 target_imgset.select_quality_images(**stack_select_config)
             # If the number of images is less than 3, use all images for stacking
